@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: flexy_postgres
+    environment:
+      POSTGRES_USER: flexy_user
+      POSTGRES_PASSWORD: flexy_pass
+      POSTGRES_DB: flexy_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  kratos:
+    image: oryd/kratos:v1.15.1
+    container_name: kratos
+    environment:
+      - DSN=postgres://flexy_user:flexy_pass@postgres:5432/flexy_db?sslmode=disable
+      - LOG_LEVEL=debug
+    ports:
+      - "4433:4433" # public
+      - "4434:4434" # admin
+    depends_on:
+      - postgres
+    command:
+      serve --dev --config /etc/kratos/kratos.yml
+
+  backend:
+    build: .
+    container_name: flexy_backend
+    ports:
+      - "3000:3000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=flexy_user
+      - DB_PASS=flexy_pass
+      - DB_NAME=flexy_db
+      - KRATOS_PUBLIC_URL=http://kratos:4433
+      - KRATOS_ADMIN_URL=http://kratos:4434
+    depends_on:
+      - postgres
+      - kratos
+    volumes:
+      - .:/app
+    command: npm run start:dev
+
+volumes:
+  postgres_data:

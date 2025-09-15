@@ -1,0 +1,38 @@
+version: v0.8.2-alpha.1
+dsn: sqlite:///var/lib/sqlite/db.sqlite?_fk=true
+
+log:
+  level: debug
+
+serve:
+  public:
+    base_url: http://localhost:4433/
+  admin:
+    base_url: http://localhost:4434/
+
+selfservice:
+  default_browser_return_url: http://localhost:3000/dashboard
+  flows:
+    login:
+      ui_url: http://localhost:3000/login
+      after:
+        default_browser_return_url: http://localhost:3000/dashboard
+    registration:
+      ui_url: http://localhost:3000/register
+      after:
+        default_browser_return_url: http://localhost:3000/dashboard
+    recovery:
+      ui_url: http://localhost:3000/recovery
+      after:
+        default_browser_return_url: http://localhost:3000/login
+    settings:
+      ui_url: http://localhost:3000/settings
+      after:
+        default_browser_return_url: http://localhost:3000/dashboard
+
+identity:
+  default_schema_url: file:///etc/config/kratos/identities/schema.json
+
+courier:
+  smtp:
+    connection_uri: smtp://user:pass@localhost:1025

@@ -1,0 +1,20 @@
+{
+  "$id": "https://schemas.flexybank.com/v1/customer",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email" },
+        "name": {
+          "type": "object",
+          "properties": {
+            "first": { "type": "string" },
+            "last": { "type": "string" }
+          }
+        }
+      },
+      "required": ["email"]
+    }
+  }
+}
