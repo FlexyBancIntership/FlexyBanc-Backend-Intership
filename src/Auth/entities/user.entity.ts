@@ -1,4 +1,11 @@
-import { Entity, Column, PrimaryGeneratedColumn, OneToMany } from 'typeorm';
+import {
+  Entity,
+  Column,
+  PrimaryGeneratedColumn,
+  OneToMany,
+  CreateDateColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 import { UserNeeds } from './userNeeds.entity';
 import { Appointment } from './appointment.entity';
 
@@ -16,6 +23,9 @@ export class User {
   @Column()
   lastName: string;
 
+  @Column({ nullable: true })
+  countryCode: string;
+
   @Column()
   phone: string;
 
@@ -29,13 +39,29 @@ export class User {
   cinNumber: string;
 
   @Column({ nullable: true })
-  country: string;
-
-  @Column({ nullable: true })
   domainActivity: string;
 
   @Column({ nullable: true })
-  pack: string; // gratuit / pro / basic / entreprise
+  pack: string;
+
+  // Nouvelles propriétés pour résoudre les erreurs
+  @Column({ nullable: true })
+  kratosIdentityId: string;
+
+  @Column({ default: false })
+  emailVerified: boolean;
+
+  @Column({ type: 'timestamp', nullable: true })
+  emailVerifiedAt: Date;
+
+  @Column({ type: 'timestamp', nullable: true })
+  lastLogin: Date;
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @UpdateDateColumn()
+  updatedAt: Date;
 
   @OneToMany(() => UserNeeds, (need) => need.user)
   needs: UserNeeds[];

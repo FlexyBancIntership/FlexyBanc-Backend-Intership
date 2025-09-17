@@ -1,3 +1,4 @@
+// userNeeds.entity.ts
 import { Entity, Column, PrimaryGeneratedColumn, ManyToOne } from 'typeorm';
 import { User } from './user.entity';
 
@@ -7,8 +8,8 @@ export class UserNeeds {
   id: number;
 
   @Column()
-  type: string; // epargne, investissement, paiement, transfert, budgétisation, crédit
+  type: string; // ⚠️ doit être "type" pour matcher ton service
 
-  @ManyToOne(() => User, (user) => user.needs)
+  @ManyToOne(() => User, (user) => user.needs, { onDelete: 'CASCADE' })
   user: User;
 }

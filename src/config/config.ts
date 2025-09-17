@@ -1,5 +1,5 @@
 import { config } from 'dotenv';
-config(); // charge .env
+config(); //.env
 
 export default {
   database: {

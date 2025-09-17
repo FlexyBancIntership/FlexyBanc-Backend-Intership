@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import config from './config/config';
-import { AuthModule } from './auth/auth.module';
+import { AuthModule } from './Auth/auth.module';
 
 @Module({
   imports: [
@@ -12,8 +12,8 @@ import { AuthModule } from './auth/auth.module';
       username: config.database.username,
       password: config.database.password,
       database: config.database.database,
-      autoLoadEntities: true, // charge automatiquement toutes les entités
-      synchronize: true, // pour dev seulement, crée les tables automatiquement
+      autoLoadEntities: true,
+      synchronize: true, // DEV ONLY
     }),
     AuthModule,
   ],
