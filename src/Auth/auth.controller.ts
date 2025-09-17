@@ -1,902 +1,511 @@
 import {
   Controller,
   Post,
-  Get,
-  Put,
-  Delete,
   Body,
-  Param,
+  Get,
   Headers,
-  HttpException,
+  HttpCode,
   HttpStatus,
+  Logger,
   BadRequestException,
-  UnauthorizedException,
-  Query,
+  UseInterceptors,
+  ClassSerializerInterceptor,
 } from '@nestjs/common';
-import { AuthService } from './auth.service';
 import {
+  AuthService,
   SignupDto,
   LoginDto,
   SubmitVerificationDto,
   RecoveryDto,
   SubmitRecoveryDto,
+  KratosWebhookData,
 } from './auth.service';
 
 @Controller('auth')
+@UseInterceptors(ClassSerializerInterceptor)
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  private readonly logger = new Logger(AuthController.name);
+
+  constructor(private readonly authService: AuthService) {}
 
   // ===========================
-  // REGISTRATION & LOGIN
+  // ENDPOINTS D'AUTHENTIFICATION
   // ===========================
 
-  @Post('register')
-  async signup(@Body() body: SignupDto) {
+  /**
+   * Endpoint d'inscription
+   */
+  @Post('signup')
+  @HttpCode(HttpStatus.CREATED)
+  async signup(@Body() signupDto: SignupDto) {
     try {
-      const result = await this.authService.signup(body);
+      this.logger.log(`Signup request for email: ${signupDto.email}`);
+
+      // Validation basique
+      if (!signupDto.email || !signupDto.password) {
+        throw new BadRequestException('Email and password are required');
+      }
+
+      if (!signupDto.firstName || !signupDto.lastName) {
+        throw new BadRequestException('First name and last name are required');
+      }
+
+      const result = await this.authService.signup(signupDto);
+
+      this.logger.log(`Signup successful for: ${signupDto.email}`);
       return {
-        status: 'success',
-        message: result.message || 'Registration successful',
+        success: true,
+        message: result.message,
         data: {
-          user: result.user,
+          user: {
+            id: result.user.id,
+            email: result.user.email,
+            firstName: result.user.firstName,
+            lastName: result.user.lastName,
+            pack: result.user.pack,
+            emailVerified: result.user.emailVerified,
+            createdAt: result.user.createdAt,
+          },
           kratosIdentity: result.kratosIdentity,
           hasKratosAccount: result.hasKratosAccount,
-        },
-      };
-    } catch (err) {
-      if (err instanceof BadRequestException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Signup error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Post('login')
-  async login(@Body() body: LoginDto) {
-    try {
-      const result = await this.authService.login(body);
-      return {
-        status: 'success',
-        message: result.message || 'Login successful',
-        data: {
-          user: result.user,
-          session: result.session,
-          sessionToken: result.sessionToken,
           method: result.method,
         },
       };
-    } catch (err) {
-      if (
-        err instanceof BadRequestException ||
-        err instanceof UnauthorizedException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
+    } catch (error) {
+      this.logger.error(`Signup failed for ${signupDto.email}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Endpoint de connexion
+   */
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  async login(@Body() loginDto: LoginDto) {
+    try {
+      this.logger.log(`Login request for email: ${loginDto.email}`);
+
+      const result = await this.authService.login(loginDto);
+
+      this.logger.log(
+        `Login successful for: ${loginDto.email} via ${result.method}`,
+      );
+      return {
+        success: true,
+        message: result.message,
+        data: {
+          user: {
+            id: result.user.id,
+            email: result.user.email,
+            firstName: result.user.firstName,
+            lastName: result.user.lastName,
+            pack: result.user.pack,
+            emailVerified: result.user.emailVerified,
+            lastLogin: result.user.lastLogin,
           },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Login error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
+          sessionToken: result.sessionToken,
+          method: result.method,
+          kratosAvailable: result.kratosAvailable,
         },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Post('logout')
-  async logout(@Headers('authorization') sessionToken: string) {
-    try {
-      const token = sessionToken?.startsWith('Bearer ')
-        ? sessionToken.replace('Bearer ', '')
-        : sessionToken;
-
-      const result = await this.authService.logout(token);
-      return {
-        status: 'success',
-        message: result.message || 'Logout successful',
-        data: {},
       };
-    } catch (err) {
-      console.error('Logout error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Logout failed',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error(`Login failed for ${loginDto.email}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Endpoint de déconnexion
+   */
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  async logout(@Headers('authorization') authHeader?: string) {
+    try {
+      const sessionToken = authHeader?.replace('Bearer ', '');
+      const result = await this.authService.logout(sessionToken);
+
+      return {
+        success: true,
+        message: result.message,
+      };
+    } catch (error) {
+      this.logger.error('Logout failed:', error.message);
+      return {
+        success: true,
+        message: 'Logout completed (with warnings)',
+        warning: error.message,
+      };
     }
   }
 
   // ===========================
-  // EMAIL VERIFICATION
+  // VERIFICATION ET RECOVERY
   // ===========================
 
-  @Post('initiate-verification')
-  async initiateVerification() {
+  /**
+   * Initier un flow de vérification
+   */
+  @Post('verification/init')
+  @HttpCode(HttpStatus.OK)
+  async initVerification() {
     try {
-      const flow = await this.authService.initVerificationFlow(
-        'http://localhost:4455/verification',
-      );
+      const flow = await this.authService.initVerificationFlow();
+
       return {
-        status: 'success',
+        success: true,
         message: 'Verification flow initialized',
         data: {
           flowId: flow.id,
-          verificationData: flow,
+          ui: flow.ui,
         },
       };
-    } catch (err) {
-      if (err instanceof BadRequestException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Verification initiation error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Verification init failed:', error.message);
+      throw error;
     }
   }
 
-  @Post('submit-verification')
-  async submitVerification(@Body() body: SubmitVerificationDto) {
+  /**
+   * Soumettre le code de vérification
+   */
+  @Post('verification/submit')
+  @HttpCode(HttpStatus.OK)
+  async submitVerification(@Body() submitDto: SubmitVerificationDto) {
     try {
-      const result = await this.authService.submitVerification(body);
+      const result = await this.authService.submitVerification(submitDto);
+
       return {
-        status: 'success',
-        message: result.message || 'Email verified successfully',
-        data: {
-          verificationData: result.data,
-        },
+        success: true,
+        message: result.message,
+        data: result.data,
       };
-    } catch (err) {
-      if (err instanceof BadRequestException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Verification submission error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Verification submission failed:', error.message);
+      throw error;
     }
   }
 
-  // ===========================
-  // PASSWORD RECOVERY
-  // ===========================
-
-  @Post('initiate-recovery')
-  async initiateRecovery(@Body() body: RecoveryDto) {
+  /**
+   * Initier la récupération de compte
+   */
+  @Post('recovery/init')
+  @HttpCode(HttpStatus.OK)
+  async initRecovery(@Body() recoveryDto: RecoveryDto) {
     try {
-      const result = await this.authService.initiateRecovery(body);
+      const result = await this.authService.initiateRecovery(recoveryDto);
+
       return {
-        status: 'success',
-        message: result.message || 'Recovery email sent successfully',
+        success: true,
+        message: result.message,
         data: {
           flowId: result.flowId,
-          recoveryData: result.data,
+          email: result.email,
         },
       };
-    } catch (err) {
-      if (err instanceof BadRequestException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Recovery initiation error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Recovery init failed:', error.message);
+      throw error;
     }
   }
 
-  @Post('submit-recovery')
-  async submitRecovery(@Body() body: SubmitRecoveryDto) {
+  /**
+   * Soumettre le code de récupération
+   */
+  @Post('recovery/submit')
+  @HttpCode(HttpStatus.OK)
+  async submitRecovery(@Body() submitDto: SubmitRecoveryDto) {
     try {
-      const result = await this.authService.submitRecovery(body);
+      const result = await this.authService.submitRecovery(submitDto);
+
       return {
-        status: 'success',
-        message: result.message || 'Account recovery successful',
-        data: {
-          recoveryData: result.data,
-        },
+        success: true,
+        message: result.message,
+        data: result.data,
       };
-    } catch (err) {
-      if (err instanceof BadRequestException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Recovery submission error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: err.message || 'Internal server error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Recovery submission failed:', error.message);
+      throw error;
     }
   }
 
   // ===========================
-  // SESSION MANAGEMENT
+  // SESSION ET PROFIL
   // ===========================
 
-  @Get('session/validate')
-  async validateSession(@Headers('authorization') sessionToken: string) {
+  /**
+   * Validation de session
+   */
+  @Get('validate')
+  async validateSession(@Headers('authorization') authHeader: string) {
     try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
+      if (!authHeader) {
+        throw new BadRequestException('Authorization header is required');
       }
 
-      const token = sessionToken.startsWith('Bearer ')
-        ? sessionToken.replace('Bearer ', '')
-        : sessionToken;
+      const sessionToken = authHeader.replace('Bearer ', '');
+      const result = await this.authService.validateSession(sessionToken);
 
-      const session = await this.authService.validateSession(token);
       return {
-        status: 'success',
+        success: true,
         message: 'Session is valid',
         data: {
-          session,
+          valid: result.valid,
+          source: result.source,
+          user: result.user
+            ? {
+                id: result.user.id,
+                email: result.user.email,
+                firstName: result.user.firstName,
+                lastName: result.user.lastName,
+                emailVerified: result.user.emailVerified,
+              }
+            : null,
+          session: result.session || null,
         },
       };
-    } catch (err) {
-      if (err instanceof UnauthorizedException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.UNAUTHORIZED,
-            message: err.message,
-          },
-          HttpStatus.UNAUTHORIZED,
-        );
-      }
-      console.error('Session validation error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Session validation failed',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Session validation failed:', error.message);
+      throw error;
     }
   }
 
-  @Get('session')
-  async getSession(@Headers('cookie') cookie: string) {
-    try {
-      if (!cookie) {
-        throw new UnauthorizedException('Cookie is required');
-      }
-
-      const session = await this.authService.getSession(cookie);
-      return {
-        status: 'success',
-        message: 'Session retrieved successfully',
-        data: {
-          session,
-        },
-      };
-    } catch (err) {
-      if (err instanceof UnauthorizedException) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode: HttpStatus.UNAUTHORIZED,
-            message: err.message,
-          },
-          HttpStatus.UNAUTHORIZED,
-        );
-      }
-      console.error('Get session error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to retrieve session',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  // ===========================
-  // USER PROFILE MANAGEMENT
-  // ===========================
-
+  /**
+   * Récupération du profil utilisateur
+   */
   @Get('profile')
-  async getUserProfile(@Headers('authorization') sessionToken: string) {
+  async getProfile(@Headers('authorization') authHeader: string) {
     try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
+      if (!authHeader) {
+        throw new BadRequestException('Authorization header is required');
       }
 
-      const token = sessionToken.startsWith('Bearer ')
-        ? sessionToken.replace('Bearer ', '')
-        : sessionToken;
+      const sessionToken = authHeader.replace('Bearer ', '');
+      const sessionData = await this.authService.validateSession(sessionToken);
 
-      const session = await this.authService.validateSession(token);
-      const user = await this.authService.getUserProfile(session);
-
-      if (!user) {
-        throw new BadRequestException('User not found');
+      if (!sessionData.valid || !sessionData.user) {
+        throw new BadRequestException('Invalid session or user not found');
       }
 
       return {
-        status: 'success',
+        success: true,
         message: 'Profile retrieved successfully',
         data: {
-          user,
+          user: sessionData.user,
+          sessionSource: sessionData.source,
         },
       };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Get profile error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to retrieve profile',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Profile retrieval failed:', error.message);
+      throw error;
     }
   }
 
-  @Put('profile/:userId')
-  async updateProfile(
-    @Param('userId') userId: number,
-    @Body() updateData: Partial<SignupDto>,
-    @Headers('authorization') sessionToken: string,
+  // ===========================
+  // WEBHOOK KRATOS
+  // ===========================
+
+  /**
+   * Endpoint pour les webhooks Kratos
+   */
+  @Post('webhook')
+  @HttpCode(HttpStatus.OK)
+  async handleWebhook(
+    @Body() webhookData: KratosWebhookData,
+    @Headers('x-webhook-secret') webhookSecret?: string,
   ) {
     try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
+      // Vérification du secret de webhook
+      const expectedSecret =
+        process.env.WEBHOOK_SECRET || 'your-webhook-secret-here';
+      if (webhookSecret !== expectedSecret) {
+        this.logger.error('Invalid webhook secret received');
+        throw new BadRequestException('Invalid webhook secret');
       }
 
-      const token = sessionToken.startsWith('Bearer ')
-        ? sessionToken.replace('Bearer ', '')
-        : sessionToken;
+      this.logger.log(`Processing Kratos webhook: ${webhookData.type}`);
 
-      await this.authService.validateSession(token);
+      await this.authService.handleKratosWebhook(webhookData);
 
-      const updatedUser = await this.authService.updateProfile(
-        userId,
-        updateData,
-      );
       return {
-        status: 'success',
-        message: 'Profile updated successfully',
-        data: {
-          user: updatedUser,
-        },
+        success: true,
+        message: 'Webhook processed successfully',
+        type: webhookData.type,
       };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Update profile error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to update profile',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Delete('profile/:userId')
-  async deleteUser(
-    @Param('userId') userId: number,
-    @Headers('authorization') sessionToken: string,
-  ) {
-    try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
-      }
-
-      const token = sessionToken.startsWith('Bearer ')
-        ? sessionToken.replace('Bearer ', '')
-        : sessionToken;
-
-      await this.authService.validateSession(token);
-
-      await this.authService.deleteUser(userId);
-      return {
-        status: 'success',
-        message: 'User deleted successfully',
-        data: {},
-      };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Delete user error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to delete user',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Webhook processing failed:', error.message);
+      throw error;
     }
   }
 
   // ===========================
-  // FLOW INITIALIZATION ROUTES
+  // ADMINISTRATION ET MONITORING
   // ===========================
 
-  @Get('flows/registration')
-  async initRegistrationFlow(@Query('return_to') returnTo?: string) {
+  /**
+   * Santé du système d'authentification
+   */
+  @Get('health')
+  async getHealth() {
     try {
-      const flow = await this.authService.initRegistrationFlow(returnTo);
+      const health = await this.authService.getHealthReport();
+
       return {
-        status: 'success',
-        message: 'Registration flow initialized',
-        data: {
-          flow,
-        },
+        success: true,
+        message: 'Health report retrieved',
+        data: health,
       };
-    } catch (err) {
-      console.error('Registration flow init error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to initialize registration flow',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Health check failed:', error.message);
+      return {
+        success: false,
+        message: 'Health check failed',
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
     }
   }
 
-  @Get('flows/login')
-  async initLoginFlow(@Query('return_to') returnTo?: string) {
-    try {
-      const flow = await this.authService.initLoginFlow(returnTo);
-      return {
-        status: 'success',
-        message: 'Login flow initialized',
-        data: {
-          flow,
-        },
-      };
-    } catch (err) {
-      console.error('Login flow init error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to initialize login flow',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Get('flows/verification')
-  async initVerificationFlow(@Query('return_to') returnTo?: string) {
-    try {
-      const flow = await this.authService.initVerificationFlow(returnTo);
-      return {
-        status: 'success',
-        message: 'Verification flow initialized',
-        data: {
-          flow,
-        },
-      };
-    } catch (err) {
-      console.error('Verification flow init error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to initialize verification flow',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Get('flows/recovery')
-  async initRecoveryFlow(@Query('return_to') returnTo?: string) {
-    try {
-      const flow = await this.authService.initRecoveryFlow(returnTo);
-      return {
-        status: 'success',
-        message: 'Recovery flow initialized',
-        data: {
-          flow,
-        },
-      };
-    } catch (err) {
-      console.error('Recovery flow init error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to initialize recovery flow',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  // ===========================
-  // KRATOS IDENTITY MANAGEMENT
-  // ===========================
-
-  @Get('kratos/identity/:identityId')
-  async getKratosIdentity(
-    @Param('identityId') identityId: string,
-    @Headers('authorization') sessionToken: string,
-  ) {
-    try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
-      }
-
-      const identity = await this.authService.getKratosIdentity(identityId);
-      return {
-        status: 'success',
-        message: 'Kratos identity retrieved',
-        data: {
-          identity,
-        },
-      };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Get Kratos identity error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to retrieve identity',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Put('kratos/identity/:identityId')
-  async updateKratosIdentity(
-    @Param('identityId') identityId: string,
-    @Body() traits: any,
-    @Headers('authorization') sessionToken: string,
-  ) {
-    try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
-      }
-
-      const identity = await this.authService.updateKratosIdentity(
-        identityId,
-        traits,
-      );
-      return {
-        status: 'success',
-        message: 'Kratos identity updated',
-        data: {
-          identity,
-        },
-      };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Update Kratos identity error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to update identity',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  @Delete('kratos/identity/:identityId')
-  async deleteKratosIdentity(
-    @Param('identityId') identityId: string,
-    @Headers('authorization') sessionToken: string,
-  ) {
-    try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
-      }
-
-      await this.authService.deleteKratosIdentity(identityId);
-      return {
-        status: 'success',
-        message: 'Kratos identity deleted',
-        data: {},
-      };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Delete Kratos identity error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to delete identity',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-  }
-
-  // ===========================
-  // SYSTEM STATUS
-  // ===========================
-
-  @Get('status')
-  async getAuthStats() {
+  /**
+   * Statistiques du système
+   */
+  @Get('stats')
+  async getStats() {
     try {
       const stats = await this.authService.getAuthStats();
+
       return {
-        status: 'success',
-        message: 'Auth statistics retrieved',
+        success: true,
+        message: 'Statistics retrieved',
         data: stats,
       };
-    } catch (err) {
-      console.error('Get auth stats error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to retrieve statistics',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error('Stats retrieval failed:', error.message);
+      throw error;
     }
   }
 
-  @Get('health')
-  async healthCheck() {
+  /**
+   * Synchronisation manuelle des identités
+   */
+  @Post('sync')
+  @HttpCode(HttpStatus.OK)
+  async syncIdentities() {
     try {
-      const kratosAvailable = await this.authService.isKratosAvailable();
+      this.logger.log('Manual sync requested');
+      const result = await this.authService.syncAllKratosIdentities();
+
       return {
-        status: 'success',
-        message: 'Health check completed',
+        success: true,
+        message: 'Synchronization completed',
+        data: result,
+      };
+    } catch (error) {
+      this.logger.error('Manual sync failed:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Synchronisation bidirectionnelle
+   */
+  @Post('sync/full')
+  @HttpCode(HttpStatus.OK)
+  async fullSync() {
+    try {
+      this.logger.log('Full bidirectional sync requested');
+      const result = await this.authService.performFullSync();
+
+      return {
+        success: true,
+        message: 'Full synchronization completed',
+        data: result,
+      };
+    } catch (error) {
+      this.logger.error('Full sync failed:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Nettoyage des données orphelines
+   */
+  @Post('cleanup')
+  @HttpCode(HttpStatus.OK)
+  async cleanup() {
+    try {
+      this.logger.log('Cleanup requested');
+      const result = await this.authService.cleanupOrphanedData();
+
+      return {
+        success: true,
+        message: 'Cleanup completed',
+        data: result,
+      };
+    } catch (error) {
+      this.logger.error('Cleanup failed:', error.message);
+      throw error;
+    }
+  }
+
+  // ===========================
+  // ENDPOINTS DE DEBUG (à supprimer en production)
+  // ===========================
+
+  /**
+   * Test de connectivité Kratos
+   */
+  @Get('debug/kratos-status')
+  async getKratosStatus() {
+    try {
+      const isAvailable = await this.authService.isKratosAvailable();
+
+      return {
+        success: true,
         data: {
-          service: 'auth',
-          healthy: true,
-          kratos: {
-            available: kratosAvailable,
-            status: kratosAvailable ? 'healthy' : 'unavailable',
-          },
+          available: isAvailable,
+          publicUrl:
+            process.env.NODE_ENV === 'docker'
+              ? 'http://kratos:4433'
+              : 'http://localhost:4433',
+          adminUrl:
+            process.env.NODE_ENV === 'docker'
+              ? 'http://kratos:4434'
+              : 'http://localhost:4434',
+          environment: process.env.NODE_ENV,
           timestamp: new Date().toISOString(),
         },
       };
-    } catch (err) {
-      console.error('Health check error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.SERVICE_UNAVAILABLE,
-          message: 'Service unhealthy',
-        },
-        HttpStatus.SERVICE_UNAVAILABLE,
-      );
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
     }
   }
-  // ===========================
-  // KRATOS WEBHOOK
-  // ===========================
 
-  @Post('sync/user/:email')
-  async syncUserByEmail(
-    @Param('email') email: string,
-    @Headers('authorization') sessionToken: string,
-  ) {
+  /**
+   * Synchronisation d'un utilisateur spécifique
+   */
+  @Post('debug/sync-user')
+  @HttpCode(HttpStatus.OK)
+  async syncSpecificUser(@Body() { email }: { email: string }) {
     try {
-      if (!sessionToken) {
-        throw new UnauthorizedException('Session token is required');
+      if (!email) {
+        throw new BadRequestException('Email is required');
       }
 
       const user = await this.authService.syncUserByEmail(email);
+
       return {
-        status: 'success',
-        message: 'User synchronized successfully',
+        success: true,
+        message: user ? 'User synchronized' : 'User not found',
         data: { user },
       };
-    } catch (err) {
-      if (
-        err instanceof UnauthorizedException ||
-        err instanceof BadRequestException
-      ) {
-        throw new HttpException(
-          {
-            status: 'error',
-            statusCode:
-              err instanceof UnauthorizedException
-                ? HttpStatus.UNAUTHORIZED
-                : HttpStatus.BAD_REQUEST,
-            message: err.message,
-          },
-          err instanceof UnauthorizedException
-            ? HttpStatus.UNAUTHORIZED
-            : HttpStatus.BAD_REQUEST,
-        );
-      }
-      console.error('Sync user error:', err);
-      throw new HttpException(
-        {
-          status: 'error',
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: 'Failed to sync user',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+    } catch (error) {
+      this.logger.error(`Sync user failed for ${email}:`, error.message);
+      throw error;
     }
   }
 }

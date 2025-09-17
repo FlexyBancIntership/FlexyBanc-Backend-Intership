@@ -3,29 +3,27 @@ import {
   BadRequestException,
   UnauthorizedException,
   Logger,
-  NotFoundException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import {
   Configuration,
   FrontendApi,
   IdentityApi,
   Session,
-  LoginFlow,
-  RegistrationFlow,
   UpdateLoginFlowBody,
   UpdateRegistrationFlowBody,
+  Identity,
+  RegistrationFlow,
+  LoginFlow,
   VerificationFlow,
   RecoveryFlow,
   UpdateRecoveryFlowBody,
-  UpdateVerificationFlowBody,
-  IdentityState,
-  Identity,
-  CreateIdentityBody,
-  UiNodeInputAttributes,
+  SettingsFlow,
+  UpdateSettingsFlowBody,
 } from '@ory/kratos-client';
-import axios from 'axios';
+import axios, { AxiosResponse } from 'axios';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Like } from 'typeorm';
+import { Repository } from 'typeorm';
 import { User } from './entities/user.entity';
 import { UserNeeds } from './entities/userNeeds.entity';
 import { Appointment } from './entities/appointment.entity';
@@ -71,7 +69,6 @@ export interface SubmitRecoveryDto {
   password?: string;
 }
 
-// Interface pour les webhooks Kratos
 export interface KratosWebhookData {
   type: string;
   data: {
@@ -84,16 +81,15 @@ export interface KratosWebhookData {
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
-  // Configuration dynamique selon l'environnement
   private readonly kratosPublicUrl =
-    process.env.NODE_ENV === 'development'
-      ? 'http://localhost:4433'
-      : 'http://kratos:4433';
+    process.env.NODE_ENV === 'docker'
+      ? 'http://kratos:4433'
+      : 'http://localhost:4433';
 
   private readonly kratosAdminUrl =
-    process.env.NODE_ENV === 'development'
-      ? 'http://localhost:4434'
-      : 'http://kratos:4434';
+    process.env.NODE_ENV === 'docker'
+      ? 'http://kratos:4434'
+      : 'http://localhost:4434';
 
   private readonly kratosPublicApi: FrontendApi;
   private readonly kratosAdminApi: IdentityApi;
@@ -101,14 +97,11 @@ export class AuthService {
   constructor(
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
-
     @InjectRepository(UserNeeds)
     private readonly needsRepo: Repository<UserNeeds>,
-
     @InjectRepository(Appointment)
     private readonly appointmentRepo: Repository<Appointment>,
   ) {
-    // Configuration des clients Kratos
     const kratosPublicConfig = new Configuration({
       basePath: this.kratosPublicUrl,
     });
@@ -117,19 +110,33 @@ export class AuthService {
       basePath: this.kratosAdminUrl,
     });
 
-    this.kratosPublicApi = new FrontendApi(kratosPublicConfig);
-    this.kratosAdminApi = new IdentityApi(kratosAdminConfig);
+    this.kratosPublicApi = new FrontendApi(
+      kratosPublicConfig,
+      undefined,
+      axios.create({
+        timeout: 10000,
+      }) as any,
+    );
+
+    this.kratosAdminApi = new IdentityApi(
+      kratosAdminConfig,
+      undefined,
+      axios.create({
+        timeout: 10000,
+      }) as any,
+    );
+
+    this.logger.log(`Kratos Public URL: ${this.kratosPublicUrl}`);
+    this.logger.log(`Kratos Admin URL: ${this.kratosAdminUrl}`);
   }
 
-  // ===========================
-  // WEBHOOK HANDLERS
-  // ===========================
-
-  /**
-   * Handler pour les webhooks Kratos - synchronise les identités avec la DB locale
-   */
   async handleKratosWebhook(webhookData: KratosWebhookData): Promise<void> {
     this.logger.log(`Received Kratos webhook: ${webhookData.type}`);
+
+    if (!webhookData.data || !webhookData.data.identity) {
+      this.logger.error('Invalid webhook data received');
+      throw new BadRequestException('Invalid webhook data');
+    }
 
     try {
       switch (webhookData.type) {
@@ -147,59 +154,74 @@ export class AuthService {
       }
     } catch (error) {
       this.logger.error('Webhook handler error:', error.message);
+      throw new InternalServerErrorException('Failed to process webhook');
     }
   }
 
-  /**
-   * Synchronise une nouvelle inscription depuis Kratos vers la DB locale
-   */
   private async handleRegistrationWebhook(identity: Identity): Promise<void> {
     const traits = identity.traits as any;
 
+    if (!traits || !traits.email) {
+      this.logger.error('Invalid identity traits received in webhook');
+      return;
+    }
+
     try {
-      // Vérifier si l'utilisateur existe déjà
-      const existingUser = await this.userRepo.findOne({
-        where: { email: traits.email },
-      });
+      await this.userRepo.manager.transaction(
+        async (transactionalEntityManager) => {
+          const existingUser = await transactionalEntityManager.findOne(User, {
+            where: { email: traits.email },
+          });
 
-      if (existingUser) {
-        this.logger.log(`User ${traits.email} already exists in local DB`);
-        return;
-      }
+          if (existingUser) {
+            existingUser.kratosIdentityId = identity.id;
+            existingUser.updatedAt = new Date();
+            await transactionalEntityManager.save(existingUser);
+            this.logger.log(
+              `Updated existing user ${traits.email} with Kratos ID`,
+            );
+            return;
+          }
 
-      // Créer l'utilisateur dans la DB locale
-      const user = new User();
-      user.email = traits.email;
-      user.firstName = traits.firstName;
-      user.lastName = traits.lastName;
-      user.phone = traits.phone;
-      user.birthDate = new Date(traits.birthDate);
-      user.cinNumber = traits.cinNumber;
-      user.countryCode = traits.countryCode || 'TN';
-      user.domainActivity = traits.domainActivity || null;
-      user.pack = traits.pack || 'basic';
-      user.kratosIdentityId = identity.id; // Lien vers l'identité Kratos
+          const user = new User();
+          user.email = traits.email;
+          user.firstName = traits.firstName || 'N/A';
+          user.lastName = traits.lastName || 'N/A';
+          user.phone = traits.phone || '';
+          user.birthDate = traits.birthDate
+            ? new Date(traits.birthDate)
+            : new Date();
+          user.cinNumber = traits.cinNumber || '';
+          user.countryCode = traits.countryCode || 'TN';
+          user.domainActivity = traits.domainActivity || null;
+          user.pack = traits.pack || 'basic';
+          user.kratosIdentityId = identity.id;
+          user.password = await bcrypt.hash('kratos-managed', 12);
+          user.createdAt = new Date();
+          user.updatedAt = new Date();
 
-      // Mot de passe factice car géré par Kratos
-      user.password = await bcrypt.hash('kratos-managed', 12);
-
-      const savedUser = await this.userRepo.save(user);
-      this.logger.log(
-        `User ${traits.email} synchronized to local DB with ID ${savedUser.id}`,
+          const savedUser = await transactionalEntityManager.save(user);
+          this.logger.log(
+            `User ${traits.email} synchronized to local DB with ID ${savedUser.id}`,
+          );
+        },
       );
     } catch (error) {
       this.logger.error(
         `Failed to sync user ${traits.email} to local DB:`,
         error.message,
       );
+      throw error;
     }
   }
 
-  /**
-   * Met à jour la dernière connexion lors du login
-   */
   private async handleLoginWebhook(identity: Identity): Promise<void> {
     const traits = identity.traits as any;
+
+    if (!traits || !traits.email) {
+      this.logger.error('Invalid identity traits received in login webhook');
+      return;
+    }
 
     try {
       const user = await this.userRepo.findOne({
@@ -208,10 +230,13 @@ export class AuthService {
 
       if (user) {
         user.lastLogin = new Date();
+        user.updatedAt = new Date();
+        if (!user.kratosIdentityId) {
+          user.kratosIdentityId = identity.id;
+        }
         await this.userRepo.save(user);
         this.logger.log(`Updated last login for user ${traits.email}`);
       } else {
-        // Si l'utilisateur n'existe pas dans la DB locale, le créer
         await this.handleRegistrationWebhook(identity);
       }
     } catch (error) {
@@ -219,1231 +244,19 @@ export class AuthService {
         `Failed to update login for user ${traits.email}:`,
         error.message,
       );
+      throw error;
     }
   }
 
-  /**
-   * Met à jour le statut de vérification de l'email
-   */
   private async handleVerificationWebhook(identity: Identity): Promise<void> {
     const traits = identity.traits as any;
 
-    try {
-      const user = await this.userRepo.findOne({
-        where: { email: traits.email },
-      });
-
-      if (user) {
-        user.emailVerified = true;
-        user.emailVerifiedAt = new Date();
-        await this.userRepo.save(user);
-        this.logger.log(`Email verified for user ${traits.email}`);
-      }
-    } catch (error) {
+    if (!traits || !traits.email) {
       this.logger.error(
-        `Failed to update verification status for user ${traits.email}:`,
-        error.message,
+        'Invalid identity traits received in verification webhook',
       );
+      return;
     }
-  }
-
-  // ===========================
-  // SYNCHRONISATION MANUELLE
-  // ===========================
-
-  /**
-   * Synchronise toutes les identités Kratos avec la DB locale
-   */
-  async syncAllKratosIdentities(): Promise<{ synced: number; errors: number }> {
-    this.logger.log('Starting full sync of Kratos identities to local DB');
-
-    let synced = 0;
-    let errors = 0;
-    let page = 1;
-    const perPage = 100;
-
-    try {
-      while (true) {
-        const response = await this.kratosAdminApi.listIdentities({
-          perPage,
-          page,
-        });
-
-        const identities = response.data;
-
-        if (!identities || identities.length === 0) {
-          break;
-        }
-
-        for (const identity of identities) {
-          try {
-            await this.handleRegistrationWebhook(identity);
-            synced++;
-          } catch (error) {
-            this.logger.error(
-              `Failed to sync identity ${identity.id}:`,
-              error.message,
-            );
-            errors++;
-          }
-        }
-
-        if (identities.length < perPage) {
-          break;
-        }
-
-        page++;
-      }
-
-      this.logger.log(`Sync completed: ${synced} synced, ${errors} errors`);
-      return { synced, errors };
-    } catch (error) {
-      this.logger.error('Failed to sync Kratos identities:', error.message);
-      throw new BadRequestException('Failed to sync identities');
-    }
-  }
-
-  /**
-   * Synchronise une identité spécifique par email
-   */
-  async syncUserByEmail(email: string): Promise<User | null> {
-    try {
-      // Rechercher l'identité dans Kratos
-      const identities = await this.kratosAdminApi.listIdentities({
-        perPage: 100,
-        page: 1,
-      });
-      const kratosIdentity = identities.data.find(
-        (id) => (id.traits as any).email === email,
-      );
-
-      if (!kratosIdentity) {
-        throw new NotFoundException(
-          `User with email ${email} not found in Kratos`,
-        );
-      }
-
-      // Synchroniser avec la DB locale
-      await this.handleRegistrationWebhook(kratosIdentity);
-
-      // Retourner l'utilisateur de la DB locale
-      return await this.userRepo.findOne({
-        where: { email },
-        relations: ['needs', 'appointments'],
-      });
-    } catch (error) {
-      this.logger.error(`Failed to sync user ${email}:`, error.message);
-      throw new BadRequestException(`Failed to sync user: ${error.message}`);
-    }
-  }
-
-  // ===========================
-  // FLOWS INITIALIZATION
-  // ===========================
-
-  /**
-   * Initialise un flow de registration
-   */
-  async initRegistrationFlow(returnTo?: string): Promise<RegistrationFlow> {
-    try {
-      const response = await this.kratosPublicApi.createBrowserRegistrationFlow(
-        {
-          returnTo,
-        },
-      );
-      return response.data;
-    } catch (error) {
-      this.logger.error(
-        'Failed to initialize registration flow:',
-        error.message,
-      );
-      throw new BadRequestException('Unable to initialize registration flow');
-    }
-  }
-
-  /**
-   * Initialise un flow de login
-   */
-  async initLoginFlow(returnTo?: string): Promise<LoginFlow> {
-    try {
-      const response = await this.kratosPublicApi.createBrowserLoginFlow({
-        returnTo,
-      });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to initialize login flow:', error.message);
-      throw new BadRequestException('Unable to initialize login flow');
-    }
-  }
-
-  /**
-   * Initialise un flow de vérification
-   */
-  async initVerificationFlow(returnTo?: string): Promise<VerificationFlow> {
-    try {
-      const response = await this.kratosPublicApi.createBrowserVerificationFlow(
-        {
-          returnTo,
-        },
-      );
-      return response.data;
-    } catch (error) {
-      this.logger.error(
-        'Failed to initialize verification flow:',
-        error.message,
-      );
-      throw new BadRequestException('Unable to initialize verification flow');
-    }
-  }
-
-  /**
-   * Initialise un flow de récupération
-   */
-  async initRecoveryFlow(returnTo?: string): Promise<RecoveryFlow> {
-    try {
-      const response = await this.kratosPublicApi.createBrowserRecoveryFlow({
-        returnTo,
-      });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to initialize recovery flow:', error.message);
-      throw new BadRequestException('Unable to initialize recovery flow');
-    }
-  }
-
-  // ===========================
-  // SIGNUP
-  // ===========================
-
-  /**
-   * Inscription d'un utilisateur avec Kratos + DB locale
-   */
-  async signup(data: SignupDto): Promise<any> {
-    try {
-      // Validation des données requises
-      if (!data.email || !data.password) {
-        throw new BadRequestException('Email and password are required');
-      }
-
-      this.logger.log(`Starting signup process for email: ${data.email}`);
-
-      // 1. Création de l'utilisateur dans notre DB locale d'abord
-      const localUser = await this.createLocalUser(data);
-
-      // 2. Tentative de création dans Kratos
-      let kratosIdentity = null;
-      try {
-        kratosIdentity = await this.createKratosIdentity(data);
-
-        // Mettre à jour l'utilisateur local avec l'ID Kratos
-        localUser.kratosIdentityId = kratosIdentity.id;
-        await this.userRepo.save(localUser);
-
-        this.logger.log(
-          `Kratos identity created successfully for: ${data.email}`,
-        );
-      } catch (kratosError) {
-        this.logger.warn(
-          `Kratos registration failed for ${data.email}:`,
-          kratosError.message,
-        );
-        // On continue même si Kratos échoue, l'utilisateur existe dans notre DB
-      }
-
-      // 3. Récupération de l'utilisateur avec toutes ses relations
-      const userWithRelations = await this.userRepo.findOne({
-        where: { id: localUser.id },
-        relations: ['needs', 'appointments'],
-      });
-
-      return {
-        message: 'User created successfully',
-        user: userWithRelations,
-        kratosIdentity: kratosIdentity ? kratosIdentity.id : null,
-        hasKratosAccount: !!kratosIdentity,
-      };
-    } catch (error) {
-      this.logger.error('Signup error:', error);
-
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
-      throw new BadRequestException(
-        error.response?.data?.ui?.messages?.[0]?.text ||
-          error.message ||
-          'Registration failed',
-      );
-    }
-  }
-
-  /**
-   * Crée un utilisateur dans notre base de données locale
-   */
-  private async createLocalUser(data: SignupDto): Promise<User> {
-    // Vérifier si l'utilisateur existe déjà
-    const existingUser = await this.userRepo.findOne({
-      where: { email: data.email },
-    });
-    if (existingUser) {
-      throw new BadRequestException('User with this email already exists');
-    }
-
-    // Création de l'entité User
-    const user = new User();
-    user.email = data.email;
-    user.firstName = data.firstName;
-    user.lastName = data.lastName;
-    user.phone = data.phone;
-    user.password = await bcrypt.hash(data.password, 12);
-    user.birthDate = new Date(data.birthDate);
-    user.cinNumber = data.cinNumber;
-    user.countryCode = data.countryCode || 'TN';
-    user.domainActivity = data.domainActivity || null;
-    user.pack = data.pack || 'basic';
-    user.createdAt = new Date();
-    user.updatedAt = new Date();
-
-    const savedUser = await this.userRepo.save(user);
-
-    // Sauvegarde des besoins si fournis
-    if (data.needs && Array.isArray(data.needs) && data.needs.length > 0) {
-      const needsEntities = data.needs.map((type: string) => {
-        const need = new UserNeeds();
-        need.type = type;
-        need.user = savedUser;
-        return need;
-      });
-      await this.needsRepo.save(needsEntities);
-    }
-
-    // Sauvegarde du rendez-vous si fourni
-    if (data.appointmentDate || data.messageToExpert) {
-      const appointment = new Appointment();
-      appointment.date = data.appointmentDate
-        ? new Date(data.appointmentDate)
-        : null;
-      appointment.message = data.messageToExpert || null;
-      appointment.user = savedUser;
-      await this.appointmentRepo.save(appointment);
-    }
-
-    return savedUser;
-  }
-
-  /**
-   * Crée une identité dans Kratos
-   */
-  private async createKratosIdentity(data: SignupDto): Promise<any> {
-    try {
-      // Initialisation du flow de registration
-      const flow = await this.initRegistrationFlow();
-
-      // Préparation du body pour la soumission
-      const submitBody: UpdateRegistrationFlowBody = {
-        method: 'password',
-        password: data.password,
-        traits: {
-          email: data.email,
-          firstName: data.firstName,
-          lastName: data.lastName,
-          phone: data.phone,
-          birthDate: data.birthDate,
-          cinNumber: data.cinNumber,
-          countryCode: data.countryCode || 'TN',
-          domainActivity: data.domainActivity || null,
-          pack: data.pack || 'basic',
-        },
-      };
-
-      // Soumission du formulaire de registration
-      const response = await this.kratosPublicApi.updateRegistrationFlow({
-        flow: flow.id,
-        updateRegistrationFlowBody: submitBody,
-      });
-
-      return response.data.identity;
-    } catch (error) {
-      this.logger.error('Kratos identity creation failed:', error);
-      throw error;
-    }
-  }
-
-  // ===========================
-  // LOGIN
-  // ===========================
-
-  /**
-   * Connexion d'un utilisateur avec Kratos + fallback DB
-   */
-  async login(credentials: LoginDto): Promise<any> {
-    const { email, password } = credentials;
-
-    if (!email || !password) {
-      throw new BadRequestException('Email and password are required');
-    }
-
-    this.logger.log(`Login attempt for email: ${email}`);
-
-    try {
-      // 1. Tentative de connexion via Kratos
-      const kratosResult = await this.loginWithKratos(email, password);
-
-      // 2. Récupération des données utilisateur depuis notre DB
-      let localUser = await this.userRepo.findOne({
-        where: { email },
-        relations: ['needs', 'appointments'],
-      });
-
-      // 3. Si l'utilisateur n'existe pas dans notre DB, le synchroniser
-      if (!localUser) {
-        this.logger.log(
-          `User ${email} not found in local DB, syncing from Kratos`,
-        );
-        localUser = await this.syncUserByEmail(email);
-      }
-
-      return {
-        message: 'Login successful via Kratos',
-        session: kratosResult.session,
-        sessionToken: kratosResult.session_token,
-        user: localUser,
-        method: 'kratos',
-      };
-    } catch (kratosError) {
-      this.logger.warn(
-        `Kratos login failed for ${email}:`,
-        kratosError.message,
-      );
-
-      // Fallback: connexion via DB locale uniquement
-      return await this.loginWithDatabase(email, password);
-    }
-  }
-
-  /**
-   * Connexion via Kratos
-   */
-  private async loginWithKratos(email: string, password: string): Promise<any> {
-    try {
-      // Initialisation du flow de login
-      const flow = await this.initLoginFlow();
-
-      // Préparation du body pour la soumission
-      const submitBody: UpdateLoginFlowBody = {
-        method: 'password',
-        identifier: email,
-        password,
-      };
-
-      // Soumission des credentials
-      const response = await this.kratosPublicApi.updateLoginFlow({
-        flow: flow.id,
-        updateLoginFlowBody: submitBody,
-      });
-
-      return response.data;
-    } catch (error) {
-      this.logger.error('Kratos login error:', error);
-      throw new UnauthorizedException(
-        'Invalid credentials or Kratos unavailable',
-      );
-    }
-  }
-
-  /**
-   * Connexion fallback via base de données locale
-   */
-  private async loginWithDatabase(
-    email: string,
-    password: string,
-  ): Promise<any> {
-    const user = await this.userRepo.findOne({
-      where: { email },
-      relations: ['needs', 'appointments'],
-    });
-
-    if (!user) {
-      throw new UnauthorizedException('Invalid email or password');
-    }
-
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid email or password');
-    }
-
-    // Mise à jour de la dernière connexion
-    user.lastLogin = new Date();
-    await this.userRepo.save(user);
-
-    // Génération d'un token simple pour le fallback
-    const sessionToken = Buffer.from(`${user.id}:${Date.now()}`).toString(
-      'base64',
-    );
-
-    return {
-      message: 'Login successful via database fallback',
-      user,
-      sessionToken,
-      method: 'database',
-    };
-  }
-
-  // ===========================
-  // VERIFICATION
-  // ===========================
-
-  /**
-   * Soumet un code de vérification
-   */
-  /**
-   * Soumet un code de vérification
-   */
-  async submitVerification(data: SubmitVerificationDto): Promise<any> {
-    try {
-      if (!data.flowId || !data.code) {
-        throw new BadRequestException(
-          'Flow ID and verification code are required',
-        );
-      }
-
-      this.logger.log(`Submitting verification code for flow: ${data.flowId}`);
-
-      // Define local interface if UpdateVerificationFlowWithCodeMethodBody is unavailable
-      interface UpdateVerificationFlowWithCodeMethodBody {
-        method: 'code';
-        code: string;
-      }
-
-      const submitBody = {
-        method: 'code',
-        code: data.code,
-      } as UpdateVerificationFlowWithCodeMethodBody;
-
-      const response = await this.kratosPublicApi.updateVerificationFlow({
-        flow: data.flowId,
-        updateVerificationFlowBody:
-          submitBody as unknown as UpdateVerificationFlowBody,
-      });
-      // Mettre à jour le statut de vérification dans la DB locale
-      const flow = await this.kratosPublicApi.getVerificationFlow({
-        id: data.flowId,
-      });
-      const emailNode = flow.data.ui?.nodes?.find(
-        (node) => (node.attributes as UiNodeInputAttributes)?.name === 'email',
-      )?.attributes as UiNodeInputAttributes | undefined;
-
-      const email = emailNode?.value;
-
-      if (email) {
-        const user = await this.userRepo.findOne({ where: { email } });
-        if (user) {
-          user.emailVerified = true;
-          user.emailVerifiedAt = new Date();
-          await this.userRepo.save(user);
-        }
-      }
-
-      return {
-        message: 'Email verified successfully',
-        data: response.data,
-      };
-    } catch (error) {
-      this.logger.error('Verification submission failed:', error.message);
-      throw new BadRequestException(
-        error.response?.data?.ui?.messages?.[0]?.text ||
-          error.message ||
-          'Failed to verify email',
-      );
-    }
-  }
-
-  // ===========================
-  // RECOVERY
-  // ===========================
-
-  /**
-   * Lance un flux de récupération pour un email
-   */
-  async initiateRecovery(data: RecoveryDto): Promise<any> {
-    try {
-      if (!data.email) {
-        throw new BadRequestException('Email is required');
-      }
-
-      this.logger.log(`Starting recovery process for email: ${data.email}`);
-
-      const flow = await this.initRecoveryFlow(
-        'http://localhost:4455/recovery',
-      );
-
-      // Préparation du body pour la soumission
-      const submitBody: UpdateRecoveryFlowBody = {
-        method: 'code',
-        email: data.email,
-      };
-
-      const response = await this.kratosPublicApi.updateRecoveryFlow({
-        flow: flow.id,
-        updateRecoveryFlowBody: submitBody,
-      });
-
-      return {
-        message: 'Recovery email sent successfully',
-        flowId: flow.id,
-        email: data.email, // Store email for use in submitRecovery
-        data: response.data,
-      };
-    } catch (error) {
-      this.logger.error('Recovery initiation failed:', error.message);
-      throw new BadRequestException(
-        error.response?.data?.ui?.messages?.[0]?.text ||
-          error.message ||
-          'Failed to initiate recovery',
-      );
-    }
-  }
-
-  /**
-   * Soumet un code de récupération et met à jour le mot de passe localement
-   */
-  async submitRecovery(data: SubmitRecoveryDto): Promise<any> {
-    try {
-      if (!data.flowId || !data.code) {
-        throw new BadRequestException('Flow ID and recovery code are required');
-      }
-
-      this.logger.log(`Submitting recovery code for flow: ${data.flowId}`);
-
-      // Submit the recovery code
-      const submitBody: UpdateRecoveryFlowBody = {
-        method: 'code',
-        code: data.code,
-      };
-
-      const response = await this.kratosPublicApi.updateRecoveryFlow({
-        flow: data.flowId,
-        updateRecoveryFlowBody: submitBody,
-      });
-
-      // If a new password is provided, update it in the local database
-      if (data.password) {
-        // Fetch the recovery flow to get the email
-        const flow = await this.kratosPublicApi.getRecoveryFlow({
-          id: data.flowId,
-        });
-        const emailNode = flow.data.ui?.nodes?.find(
-          (node) =>
-            (node.attributes as UiNodeInputAttributes)?.name === 'email',
-        )?.attributes as UiNodeInputAttributes | undefined;
-
-        const email = emailNode?.value;
-
-        if (!email) {
-          throw new BadRequestException(
-            'Could not retrieve email from recovery flow',
-          );
-        }
-
-        const user = await this.userRepo.findOne({
-          where: { email },
-        });
-        if (user) {
-          user.password = await bcrypt.hash(data.password, 12);
-          user.updatedAt = new Date();
-          await this.userRepo.save(user);
-
-          // Update password in Kratos if user has a Kratos identity
-          if (user.kratosIdentityId) {
-            try {
-              await this.kratosAdminApi.updateIdentity({
-                id: user.kratosIdentityId,
-                updateIdentityBody: {
-                  schema_id: 'default',
-                  traits: (await this.getKratosIdentity(user.kratosIdentityId))
-                    .traits,
-                  state: IdentityState.Active,
-                  credentials: {
-                    password: {
-                      config: {
-                        password: data.password,
-                      },
-                    },
-                  },
-                },
-              });
-              this.logger.log(
-                `Updated Kratos identity password for user ${email}`,
-              );
-            } catch (error) {
-              this.logger.warn(
-                `Failed to update Kratos identity password for user ${email}:`,
-                error.message,
-              );
-            }
-          }
-        }
-      }
-
-      return {
-        message: 'Account recovery successful',
-        data: response.data,
-      };
-    } catch (error) {
-      this.logger.error('Recovery submission failed:', error.message);
-      throw new BadRequestException(
-        error.response?.data?.ui?.messages?.[0]?.text ||
-          error.message ||
-          'Failed to recover account',
-      );
-    }
-  }
-
-  // ===========================
-  // SESSION MANAGEMENT
-  // ===========================
-
-  /**
-   * Vérification d'une session Kratos
-   */
-  async validateSession(sessionToken: string): Promise<Session> {
-    try {
-      const response = await this.kratosPublicApi.toSession({
-        cookie: `ory_kratos_session=${sessionToken}`,
-      });
-
-      return response.data;
-    } catch (error) {
-      this.logger.error('Session validation failed:', error.message);
-      throw new UnauthorizedException('Invalid or expired session');
-    }
-  }
-
-  /**
-   * Récupération d'une session à partir du cookie
-   */
-  async getSession(cookie: string): Promise<Session> {
-    try {
-      const response = await this.kratosPublicApi.toSession({ cookie });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to get session:', error.message);
-      throw new UnauthorizedException('Unable to verify session');
-    }
-  }
-
-  /**
-   * Récupération du profil utilisateur complet
-   */
-  async getUserProfile(sessionOrEmail: string | Session): Promise<User | null> {
-    let email: string;
-
-    if (typeof sessionOrEmail === 'string') {
-      email = sessionOrEmail;
-    } else {
-      email = (sessionOrEmail.identity?.traits as any)?.email;
-    }
-
-    if (!email) {
-      return null;
-    }
-
-    let user = await this.userRepo.findOne({
-      where: { email },
-      relations: ['needs', 'appointments'],
-    });
-
-    // Si l'utilisateur n'existe pas dans la DB locale, tenter de le synchroniser
-    if (!user) {
-      try {
-        user = await this.syncUserByEmail(email);
-      } catch (error) {
-        this.logger.warn(`Failed to sync user ${email}:`, error.message);
-      }
-    }
-
-    return user;
-  }
-
-  // ===========================
-  // LOGOUT
-  // ===========================
-
-  /**
-   * Déconnexion de l'utilisateur
-   */
-  async logout(sessionToken?: string): Promise<any> {
-    if (!sessionToken) {
-      return { message: 'Logout successful (no session to invalidate)' };
-    }
-
-    try {
-      // Tentative de déconnexion via Kratos
-      const logoutFlow = await this.kratosPublicApi.createBrowserLogoutFlow({
-        cookie: `ory_kratos_session=${sessionToken}`,
-      });
-
-      await this.kratosPublicApi.updateLogoutFlow({
-        token: logoutFlow.data.logout_token,
-      });
-
-      return { message: 'Logout successful via Kratos' };
-    } catch (error) {
-      this.logger.warn('Kratos logout failed:', error.message);
-      return { message: 'Logout successful (Kratos unavailable)' };
-    }
-  }
-
-  // ===========================
-  // USER MANAGEMENT
-  // ===========================
-
-  /**
-   * Mise à jour du profil utilisateur
-   */
-  async updateProfile(
-    userId: number,
-    updateData: Partial<SignupDto>,
-  ): Promise<User> {
-    const user = await this.userRepo.findOne({
-      where: { id: userId },
-      relations: ['needs', 'appointments'],
-    });
-
-    if (!user) {
-      throw new BadRequestException('User not found');
-    }
-
-    // Mise à jour des champs de base
-    if (updateData.firstName) user.firstName = updateData.firstName;
-    if (updateData.lastName) user.lastName = updateData.lastName;
-    if (updateData.phone) user.phone = updateData.phone;
-    if (updateData.countryCode) user.countryCode = updateData.countryCode;
-    if (updateData.domainActivity)
-      user.domainActivity = updateData.domainActivity;
-    if (updateData.pack) user.pack = updateData.pack;
-    if (updateData.birthDate) user.birthDate = new Date(updateData.birthDate);
-
-    // Mise à jour du mot de passe si fourni
-    if (updateData.password) {
-      user.password = await bcrypt.hash(updateData.password, 12);
-    }
-
-    user.updatedAt = new Date();
-    const updatedUser = await this.userRepo.save(user);
-
-    // Mise à jour des besoins si fournis
-    if (updateData.needs) {
-      // Suppression des anciens besoins
-      await this.needsRepo.delete({ user: { id: userId } });
-
-      // Création des nouveaux besoins
-      if (updateData.needs.length > 0) {
-        const needsEntities = updateData.needs.map((type: string) => {
-          const need = new UserNeeds();
-          need.type = type;
-          need.user = updatedUser;
-          return need;
-        });
-        await this.needsRepo.save(needsEntities);
-      }
-    }
-
-    // Mise à jour de l'identité Kratos si elle existe
-    if (user.kratosIdentityId) {
-      try {
-        await this.updateKratosIdentity(user.kratosIdentityId, {
-          email: user.email,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          phone: user.phone,
-          birthDate: user.birthDate.toISOString().split('T')[0],
-          cinNumber: user.cinNumber,
-          countryCode: user.countryCode,
-          domainActivity: user.domainActivity,
-          pack: user.pack,
-        });
-      } catch (error) {
-        this.logger.warn(
-          `Failed to update Kratos identity for user ${userId}:`,
-          error.message,
-        );
-      }
-    }
-
-    return await this.userRepo.findOne({
-      where: { id: userId },
-      relations: ['needs', 'appointments'],
-    });
-  }
-
-  /**
-   * Suppression d'un utilisateur
-   */
-  async deleteUser(userId: number): Promise<void> {
-    const user = await this.userRepo.findOne({ where: { id: userId } });
-
-    if (!user) {
-      throw new BadRequestException('User not found');
-    }
-
-    // Suppression de l'identité Kratos si elle existe
-    if (user.kratosIdentityId) {
-      try {
-        await this.deleteKratosIdentity(user.kratosIdentityId);
-      } catch (error) {
-        this.logger.warn(
-          `Failed to delete Kratos identity for user ${userId}:`,
-          error.message,
-        );
-      }
-    }
-
-    // Suppression des relations
-    await this.needsRepo.delete({ user: { id: userId } });
-    await this.appointmentRepo.delete({ user: { id: userId } });
-
-    // Suppression de l'utilisateur
-    await this.userRepo.delete(userId);
-
-    this.logger.log(`User ${userId} deleted successfully`);
-  }
-
-  // ===========================
-  // UTILITY METHODS
-  // ===========================
-
-  /**
-   * Vérification de la disponibilité de Kratos
-   */
-  async isKratosAvailable(): Promise<boolean> {
-    try {
-      await axios.get(`${this.kratosPublicUrl}/health/ready`, {
-        timeout: 5000,
-      });
-      return true;
-    } catch (error) {
-      this.logger.warn('Kratos health check failed:', error.message);
-      return false;
-    }
-  }
-
-  /**
-   * Récupération des statistiques d'authentification
-   */
-  async getAuthStats(): Promise<any> {
-    const totalUsers = await this.userRepo.count();
-    const verifiedUsers = await this.userRepo.count({
-      where: { emailVerified: true },
-    });
-    const kratosAvailable = await this.isKratosAvailable();
-
-    // Récupération du nombre d'identités Kratos
-    let kratosIdentities = 0;
-    try {
-      const response = await this.kratosAdminApi.listIdentities({
-        perPage: 1,
-        page: 1,
-      });
-      kratosIdentities = parseInt(response.headers['x-total-count']) || 0;
-    } catch (error) {
-      this.logger.warn('Failed to get Kratos identities count:', error.message);
-    }
-
-    return {
-      totalUsers,
-      verifiedUsers,
-      kratosIdentities,
-      kratosAvailable,
-      kratosUrl: this.kratosPublicUrl,
-      lastSync: new Date().toISOString(),
-    };
-  }
-
-  /**
-   * Récupération de tous les utilisateurs avec pagination
-   */
-  async getAllUsers(
-    page = 1,
-    limit = 10,
-  ): Promise<{
-    users: User[];
-    total: number;
-    page: number;
-    totalPages: number;
-  }> {
-    const [users, total] = await this.userRepo.findAndCount({
-      relations: ['needs', 'appointments'],
-      skip: (page - 1) * limit,
-      take: limit,
-      order: { createdAt: 'DESC' },
-    });
-
-    return {
-      users,
-      total,
-      page,
-      totalPages: Math.ceil(total / limit),
-    };
-  }
-
-  /**
-   * Recherche d'utilisateurs par email ou nom
-   */
-  async searchUsers(
-    query: string,
-    page = 1,
-    limit = 10,
-  ): Promise<{ users: User[]; total: number }> {
-    const [users, total] = await this.userRepo.findAndCount({
-      where: [
-        { email: Like(`%${query}%`) },
-        { firstName: Like(`%${query}%`) },
-        { lastName: Like(`%${query}%`) },
-      ],
-      relations: ['needs', 'appointments'],
-      skip: (page - 1) * limit,
-      take: limit,
-      order: { createdAt: 'DESC' },
-    });
-
-    return { users, total };
-  }
-
-  // ===========================
-  // ADDITIONAL KRATOS METHODS
-  // ===========================
-
-  /**
-   * Récupération d'une identité par ID depuis Kratos
-   */
-  async getKratosIdentity(identityId: string): Promise<any> {
-    try {
-      const response = await this.kratosAdminApi.getIdentity({
-        id: identityId,
-      });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to get Kratos identity:', error.message);
-      throw new BadRequestException('Identity not found');
-    }
-  }
-
-  /**
-   * Récupération d'une identité Kratos par email
-   */
-  async getKratosIdentityByEmail(email: string): Promise<any> {
-    try {
-      const identities = await this.kratosAdminApi.listIdentities({
-        perPage: 100,
-        page: 1,
-      });
-      const identity = identities.data.find(
-        (id) => (id.traits as any).email === email,
-      );
-
-      if (!identity) {
-        throw new NotFoundException(`Identity with email ${email} not found`);
-      }
-
-      return identity;
-    } catch (error) {
-      this.logger.error(
-        'Failed to get Kratos identity by email:',
-        error.message,
-      );
-      throw new BadRequestException('Failed to get identity by email');
-    }
-  }
-
-  /**
-   * Mise à jour d'une identité Kratos
-   */
-  async updateKratosIdentity(identityId: string, traits: any): Promise<any> {
-    try {
-      const response = await this.kratosAdminApi.updateIdentity({
-        id: identityId,
-        updateIdentityBody: {
-          schema_id: 'default',
-          traits,
-          state: IdentityState.Active,
-        },
-      });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to update Kratos identity:', error.message);
-      throw new BadRequestException('Failed to update identity');
-    }
-  }
-
-  /**
-   * Suppression d'une identité Kratos
-   */
-  async deleteKratosIdentity(identityId: string): Promise<void> {
-    try {
-      await this.kratosAdminApi.deleteIdentity({ id: identityId });
-      this.logger.log(`Kratos identity ${identityId} deleted successfully`);
-    } catch (error) {
-      this.logger.error('Failed to delete Kratos identity:', error.message);
-      throw new BadRequestException('Failed to delete identity');
-    }
-  }
-
-  /**
-   * Liste de toutes les identités Kratos avec pagination
-   */
-  async listKratosIdentities(page = 1, limit = 100): Promise<any> {
-    try {
-      const response = await this.kratosAdminApi.listIdentities({
-        perPage: limit,
-        page,
-      });
-      return {
-        identities: response.data,
-        total: parseInt(response.headers['x-total-count']) || 0,
-        page,
-        limit,
-      };
-    } catch (error) {
-      this.logger.error('Failed to list Kratos identities:', error.message);
-      throw new BadRequestException('Failed to list identities');
-    }
-  }
-
-  /**
-   * Création manuelle d'une identité Kratos
-   */
-  async createKratosIdentityManual(
-    traits: any,
-    password?: string,
-  ): Promise<any> {
-    try {
-      const identityPayload: CreateIdentityBody = {
-        schema_id: 'default',
-        traits,
-        state: IdentityState.Active,
-      };
-
-      if (password) {
-        identityPayload.credentials = {
-          password: {
-            config: {
-              password,
-            },
-          },
-        };
-      }
-
-      const response = await this.kratosAdminApi.createIdentity({
-        createIdentityBody: identityPayload,
-      });
-      return response.data;
-    } catch (error) {
-      this.logger.error(
-        'Failed to create Kratos identity manually:',
-        error.message,
-      );
-      throw new BadRequestException('Failed to create identity');
-    }
-  }
-
-  // ===========================
-  // MAINTENANCE & MONITORING
-  // ===========================
-
-  /**
-   * Nettoyage des sessions expirées
-   */
-  async cleanupExpiredSessions(): Promise<{ cleaned: number }> {
-    try {
-      // Kratos gère automatiquement le nettoyage des sessions
-      // Ici on peut nettoyer nos propres données si nécessaire
-      this.logger.log('Session cleanup completed');
-      return { cleaned: 0 };
-    } catch (error) {
-      this.logger.error('Session cleanup failed:', error.message);
-      throw new BadRequestException('Session cleanup failed');
-    }
-  }
-
-  /**
-   * Rapport de santé complet du système d'authentification
-   */
-  async getHealthReport(): Promise<any> {
-    const kratosAvailable = await this.isKratosAvailable();
-    const stats = await this.getAuthStats();
-
-    const report = {
-      timestamp: new Date().toISOString(),
-      services: {
-        kratos: {
-          available: kratosAvailable,
-          publicUrl: this.kratosPublicUrl,
-          adminUrl: this.kratosAdminUrl,
-        },
-        database: {
-          available: true, // On peut ajouter une vraie vérification ici
-          totalUsers: stats.totalUsers,
-          verifiedUsers: stats.verifiedUsers,
-        },
-      },
-      synchronization: {
-        kratosIdentities: stats.kratosIdentities,
-        localUsers: stats.totalUsers,
-        syncNeeded: stats.kratosIdentities !== stats.totalUsers,
-      },
-      status: kratosAvailable ? 'healthy' : 'degraded',
-    };
-
-    return report;
-  }
-  // Ajoutez ces nouvelles méthodes à votre AuthService existant
-
-  // ===========================
-  // WEBHOOK HANDLERS AMÉLIORÉS
-  // ===========================
-
-  // Ajoutez ces méthodes manquantes à votre AuthService
-
-  /**
-   * Mise à jour de la dernière connexion lors du login - version améliorée
-   */
-  private async handleLoginWebhookImproved(identity: Identity): Promise<void> {
-    const traits = identity.traits as any;
-
-    try {
-      const user = await this.userRepo.findOne({
-        where: { email: traits.email },
-      });
-
-      if (user) {
-        user.lastLogin = new Date();
-        user.updatedAt = new Date();
-        if (!user.kratosIdentityId) {
-          user.kratosIdentityId = identity.id;
-        }
-        await this.userRepo.save(user);
-        this.logger.log(`Updated last login for user ${traits.email}`);
-      } else {
-        // Si l'utilisateur n'existe pas dans la DB locale, le créer
-        await this.handleRegistrationWebhookImproved(identity);
-      }
-    } catch (error) {
-      this.logger.error(
-        `Failed to update login for user ${traits.email}:`,
-        error.message,
-      );
-      throw error;
-    }
-  }
-
-  /**
-   * Met à jour le statut de vérification de l'email - version améliorée
-   */
-  private async handleVerificationWebhookImproved(
-    identity: Identity,
-  ): Promise<void> {
-    const traits = identity.traits as any;
 
     try {
       const user = await this.userRepo.findOne({
@@ -1460,10 +273,7 @@ export class AuthService {
         await this.userRepo.save(user);
         this.logger.log(`Email verified for user ${traits.email}`);
       } else {
-        // Si l'utilisateur n'existe pas, le créer d'abord
-        await this.handleRegistrationWebhookImproved(identity);
-
-        // Puis marquer comme vérifié
+        await this.handleRegistrationWebhook(identity);
         const newUser = await this.userRepo.findOne({
           where: { email: traits.email },
         });
@@ -1482,75 +292,584 @@ export class AuthService {
     }
   }
 
-  /**
-   * Correction de la méthode handleRegistrationWebhookImproved
-   */
-  private async handleRegistrationWebhookImproved(
-    identity: Identity,
-  ): Promise<void> {
-    const traits = identity.traits as any;
-
-    this.logger.log(`Processing registration webhook for: ${traits.email}`);
-
+  async isKratosAvailable(): Promise<boolean> {
     try {
-      // Transaction pour assurer la cohérence
-      await this.userRepo.manager.transaction(
-        async (transactionalEntityManager) => {
-          // Vérifier si l'utilisateur existe déjà
-          const existingUser = await transactionalEntityManager.findOne(User, {
-            where: { email: traits.email },
-          });
+      await axios.get(`${this.kratosPublicUrl}/health/ready`, {
+        timeout: 5000,
+      });
+      this.logger.log('Kratos is available');
+      return true;
+    } catch {
+      this.logger.warn('Kratos health check failed');
+      return false;
+    }
+  }
 
-          if (existingUser) {
-            // Mise à jour de l'utilisateur existant avec l'ID Kratos
-            existingUser.kratosIdentityId = identity.id;
-            existingUser.updatedAt = new Date();
-            await transactionalEntityManager.save(existingUser);
+  async signup(data: SignupDto): Promise<any> {
+    try {
+      if (!data.email || !data.password) {
+        throw new BadRequestException('Email and password are required');
+      }
+
+      this.logger.log(`Starting signup process for email: ${data.email}`);
+
+      const kratosAvailable = await this.isKratosAvailable();
+      const localUser = await this.createLocalUser(data);
+
+      let kratosResult = null;
+
+      if (kratosAvailable) {
+        try {
+          kratosResult = await this.createKratosIdentity(data);
+
+          if (kratosResult) {
+            localUser.kratosIdentityId = kratosResult.id;
+            await this.userRepo.save(localUser);
             this.logger.log(
-              `Updated existing user ${traits.email} with Kratos ID`,
+              `Kratos identity created successfully for: ${data.email}`,
             );
-            return;
+          }
+        } catch (kratosError) {
+          this.logger.warn(
+            `Kratos registration failed for ${data.email}:`,
+            kratosError.message,
+          );
+        }
+      } else {
+        this.logger.warn(
+          'Kratos unavailable during signup, using local DB only',
+        );
+      }
+
+      const userWithRelations = await this.userRepo.findOne({
+        where: { id: localUser.id },
+        relations: ['needs', 'appointments'],
+      });
+
+      return {
+        message: 'User created successfully',
+        user: userWithRelations,
+        kratosIdentity: kratosResult ? kratosResult.id : null,
+        hasKratosAccount: !!kratosResult,
+        method: kratosResult ? 'hybrid' : 'local_only',
+      };
+    } catch (error) {
+      this.logger.error('Signup error:', error);
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      if (error.response?.status === 400) {
+        const kratosError =
+          error.response.data?.ui?.messages?.[0]?.text || 'Invalid input';
+        throw new BadRequestException(kratosError);
+      }
+
+      throw new InternalServerErrorException(
+        error.message || 'Registration failed',
+      );
+    }
+  }
+
+  private async createLocalUser(data: SignupDto): Promise<User> {
+    try {
+      const existingUser = await this.userRepo.findOne({
+        where: { email: data.email },
+      });
+      if (existingUser) {
+        throw new BadRequestException('User with this email already exists');
+      }
+
+      return await this.userRepo.manager.transaction(
+        async (transactionalEntityManager) => {
+          const user = new User();
+          user.email = data.email;
+          user.firstName = data.firstName || '';
+          user.lastName = data.lastName || '';
+          user.phone = data.phone || '';
+          user.password = await bcrypt.hash(data.password, 12);
+
+          try {
+            user.birthDate = data.birthDate
+              ? new Date(data.birthDate)
+              : new Date();
+          } catch {
+            user.birthDate = new Date();
           }
 
-          // Création d'un nouvel utilisateur
-          const user = new User();
-          user.email = traits.email;
-          user.firstName = traits.firstName;
-          user.lastName = traits.lastName;
-          user.phone = traits.phone;
-          user.birthDate = new Date(traits.birthDate);
-          user.cinNumber = traits.cinNumber;
-          user.countryCode = traits.countryCode || 'TN';
-          user.domainActivity = traits.domainActivity || null;
-          user.pack = traits.pack || 'basic';
-          user.kratosIdentityId = identity.id;
-          user.password = await bcrypt.hash('kratos-managed', 12);
+          user.cinNumber = data.cinNumber || '';
+          user.countryCode = data.countryCode || 'TN';
+          user.domainActivity = data.domainActivity || null;
+          user.pack = data.pack || 'basic';
           user.createdAt = new Date();
           user.updatedAt = new Date();
+          user.emailVerified = false;
 
-          await transactionalEntityManager.save(user);
-          this.logger.log(
-            `Created new user ${traits.email} from Kratos webhook`,
-          );
+          const savedUser = await transactionalEntityManager.save(User, user);
+
+          if (
+            data.needs &&
+            Array.isArray(data.needs) &&
+            data.needs.length > 0
+          ) {
+            const needsEntities = data.needs.map((type: string) => {
+              const need = new UserNeeds();
+              need.type = type;
+              need.user = savedUser;
+              return need;
+            });
+            await transactionalEntityManager.save(UserNeeds, needsEntities);
+          }
+
+          if (data.appointmentDate || data.messageToExpert) {
+            const appointment = new Appointment();
+            appointment.date = data.appointmentDate
+              ? new Date(data.appointmentDate)
+              : null;
+            appointment.message = data.messageToExpert || null;
+            appointment.user = savedUser;
+            await transactionalEntityManager.save(Appointment, appointment);
+          }
+
+          return savedUser;
         },
       );
     } catch (error) {
-      this.logger.error(
-        `Failed to sync user ${traits.email} from webhook:`,
-        error.message,
-      );
+      this.logger.error('Failed to create local user:', error.message);
       throw error;
     }
   }
-  /**
-   * Synchronisation automatique périodique
-   */
-  async performPeriodicSync(): Promise<{
+
+  private async createKratosIdentity(data: SignupDto): Promise<any> {
+    try {
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available');
+      }
+
+      const flow = (await Promise.race([
+        this.kratosPublicApi.createBrowserRegistrationFlow({}),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Registration flow timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<RegistrationFlow>;
+
+      if (!flow || !flow.data) {
+        throw new Error('Failed to initialize registration flow');
+      }
+
+      const submitBody: UpdateRegistrationFlowBody = {
+        method: 'password',
+        password: data.password,
+        traits: {
+          email: data.email,
+          firstName: data.firstName,
+          lastName: data.lastName,
+          phone: data.phone,
+          birthDate: data.birthDate,
+          cinNumber: data.cinNumber,
+          countryCode: data.countryCode || 'TN',
+          domainActivity: data.domainActivity || null,
+          pack: data.pack || 'basic',
+        },
+      };
+
+      const response = (await Promise.race([
+        this.kratosPublicApi.updateRegistrationFlow({
+          flow: flow.data.id,
+          updateRegistrationFlowBody: submitBody,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Registration submission timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<{ identity: Identity }>;
+
+      return response.data.identity;
+    } catch (error) {
+      this.logger.error('Kratos identity creation failed:', error);
+
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+        throw new Error('Cannot connect to Kratos service');
+      }
+
+      if (error.response?.status === 400) {
+        throw new Error(
+          error.response.data?.ui?.messages?.[0]?.text ||
+            'Invalid registration data',
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  async login(credentials: LoginDto): Promise<any> {
+    const { email, password } = credentials;
+
+    if (!email || !password) {
+      throw new BadRequestException('Email and password are required');
+    }
+
+    this.logger.log(`Login attempt for email: ${email}`);
+
+    const localUser = await this.userRepo.findOne({
+      where: { email },
+      relations: ['needs', 'appointments'],
+    });
+
+    if (!localUser) {
+      throw new UnauthorizedException('Invalid email or password');
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, localUser.password);
+    if (!isPasswordValid) {
+      throw new UnauthorizedException('Invalid email or password');
+    }
+
+    const kratosAvailable = await this.isKratosAvailable();
+    let kratosResult = null;
+
+    if (kratosAvailable && localUser.kratosIdentityId) {
+      try {
+        kratosResult = await this.loginWithKratos(email, password);
+        this.logger.log(`Kratos login successful for ${email}`);
+      } catch {
+        this.logger.warn(`Kratos login failed for ${email}, using local auth`);
+      }
+    }
+
+    localUser.lastLogin = new Date();
+    localUser.updatedAt = new Date();
+    await this.userRepo.save(localUser);
+
+    const sessionToken =
+      kratosResult?.session_token ||
+      Buffer.from(`${localUser.id}:${Date.now()}`).toString('base64');
+
+    return {
+      message: 'Login successful',
+      session: kratosResult?.session || null,
+      sessionToken,
+      user: localUser,
+      method: kratosResult ? 'kratos' : 'local',
+      kratosAvailable,
+    };
+  }
+
+  private async loginWithKratos(email: string, password: string): Promise<any> {
+    try {
+      const flow = (await Promise.race([
+        this.kratosPublicApi.createBrowserLoginFlow({}),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Login flow timeout')), 10000),
+        ),
+      ])) as AxiosResponse<LoginFlow>;
+
+      if (!flow || !flow.data) {
+        throw new Error('Failed to initialize login flow');
+      }
+
+      const submitBody: UpdateLoginFlowBody = {
+        method: 'password',
+        identifier: email,
+        password,
+      };
+
+      const response = (await Promise.race([
+        this.kratosPublicApi.updateLoginFlow({
+          flow: flow.data.id,
+          updateLoginFlowBody: submitBody,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Login submission timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<{ session: Session; session_token: string }>;
+
+      return response.data;
+    } catch {
+      this.logger.error('Kratos login error');
+      throw new UnauthorizedException(
+        'Invalid credentials or Kratos unavailable',
+      );
+    }
+  }
+
+  async logout(sessionToken: string | undefined): Promise<{ message: string }> {
+    if (!sessionToken) {
+      throw new BadRequestException('Session token is required');
+    }
+
+    this.logger.log('Logout attempt');
+
+    if (await this.isKratosAvailable()) {
+      try {
+        await axios.post(
+          `${this.kratosPublicUrl}/self-service/logout/browser`,
+          { session_token: sessionToken },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        );
+        this.logger.log('Kratos session invalidated');
+        return { message: 'Logout successful' };
+      } catch (error) {
+        this.logger.warn('Kratos logout failed:', error.message);
+      }
+    }
+
+    // For local sessions, we rely on client-side token invalidation
+    return { message: 'Logout successful (local session)' };
+  }
+
+  async initVerificationFlow(): Promise<VerificationFlow> {
+    try {
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available');
+      }
+
+      const response = (await Promise.race([
+        this.kratosPublicApi.createBrowserVerificationFlow({}),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Verification flow timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<VerificationFlow>;
+
+      if (!response || !response.data) {
+        throw new Error('Failed to initialize verification flow');
+      }
+
+      this.logger.log('Verification flow initialized');
+      return response.data;
+    } catch (error) {
+      this.logger.error('Verification flow initialization failed:', error);
+      throw new InternalServerErrorException(
+        error.message || 'Failed to initialize verification flow',
+      );
+    }
+  }
+
+  async submitVerification(
+    submitDto: SubmitVerificationDto,
+  ): Promise<{ message: string; data: any }> {
+    try {
+      if (!submitDto.flowId || !submitDto.code) {
+        throw new BadRequestException('Flow ID and code are required');
+      }
+
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available');
+      }
+
+      const submitBody = {
+        method: 'code',
+        code: submitDto.code,
+      } as any; // Type assertion to bypass strict type checking
+
+      const response = (await Promise.race([
+        this.kratosPublicApi.updateVerificationFlow({
+          flow: submitDto.flowId,
+          updateVerificationFlowBody: submitBody,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Verification submission timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<{ identity: Identity }>;
+
+      const identity = response.data.identity;
+      await this.handleVerificationWebhook(identity);
+
+      this.logger.log(`Verification successful for ${identity.traits.email}`);
+      return {
+        message: 'Verification successful',
+        data: { identityId: identity.id },
+      };
+    } catch (error) {
+      this.logger.error('Verification submission failed:', error);
+
+      if (error.response?.status === 400) {
+        throw new BadRequestException(
+          error.response.data?.ui?.messages?.[0]?.text ||
+            'Invalid verification code',
+        );
+      }
+
+      throw new InternalServerErrorException(
+        error.message || 'Verification failed',
+      );
+    }
+  }
+
+  async initiateRecovery(recoveryDto: RecoveryDto): Promise<{
+    message: string;
+    flowId: string;
+    email: string;
+  }> {
+    try {
+      if (!recoveryDto.email) {
+        throw new BadRequestException('Email is required');
+      }
+
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available');
+      }
+
+      const response = (await Promise.race([
+        this.kratosPublicApi.createBrowserRecoveryFlow({}),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Recovery flow timeout')), 10000),
+        ),
+      ])) as AxiosResponse<RecoveryFlow>;
+
+      if (!response || !response.data) {
+        throw new Error('Failed to initialize recovery flow');
+      }
+
+      const submitBody: UpdateRecoveryFlowBody = {
+        method: 'code',
+        email: recoveryDto.email,
+      };
+
+      await this.kratosPublicApi.updateRecoveryFlow({
+        flow: response.data.id,
+        updateRecoveryFlowBody: submitBody,
+      });
+
+      this.logger.log(`Recovery flow initiated for ${recoveryDto.email}`);
+      return {
+        message: 'Recovery flow initiated',
+        flowId: response.data.id,
+        email: recoveryDto.email,
+      };
+    } catch (error) {
+      this.logger.error('Recovery initiation failed:', error);
+
+      if (error.response?.status === 400) {
+        throw new BadRequestException(
+          error.response.data?.ui?.messages?.[0]?.text ||
+            'Invalid recovery data',
+        );
+      }
+
+      throw new InternalServerErrorException(
+        error.message || 'Failed to initiate recovery',
+      );
+    }
+  }
+
+  async submitRecovery(
+    submitDto: SubmitRecoveryDto,
+  ): Promise<{ message: string; data: any }> {
+    try {
+      if (!submitDto.flowId || !submitDto.code) {
+        throw new BadRequestException('Flow ID and code are required');
+      }
+
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available');
+      }
+
+      // Step 1: Submit recovery code
+      const submitBody: UpdateRecoveryFlowBody = {
+        method: 'code',
+        code: submitDto.code,
+      };
+
+      const recoveryResponse = (await Promise.race([
+        this.kratosPublicApi.updateRecoveryFlow({
+          flow: submitDto.flowId,
+          updateRecoveryFlowBody: submitBody,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Recovery submission timeout')),
+            10000,
+          ),
+        ),
+      ])) as AxiosResponse<{ identity: Identity; session_token: string }>;
+
+      const identity = recoveryResponse.data.identity;
+      const sessionToken = recoveryResponse.data.session_token;
+
+      // Step 2: Update password if provided
+      if (submitDto.password) {
+        const settingsFlow = (await Promise.race([
+          this.kratosPublicApi.createBrowserSettingsFlow({
+            cookie: `ory_kratos_session=${sessionToken}`,
+          }),
+          new Promise((_, reject) => {
+            setTimeout(
+              () => reject(new Error('Recovery submission timeout')),
+              10000,
+            );
+          }),
+        ])) as AxiosResponse<SettingsFlow>;
+
+        const settingsBody: UpdateSettingsFlowBody = {
+          method: 'password',
+          password: submitDto.password,
+        };
+
+        await this.kratosPublicApi.updateSettingsFlow({
+          flow: settingsFlow.data.id,
+          updateSettingsFlowBody: settingsBody,
+        });
+
+        const localUser = await this.userRepo.findOne({
+          where: { kratosIdentityId: identity.id },
+        });
+        if (localUser) {
+          localUser.password = await bcrypt.hash(submitDto.password, 12);
+          await this.userRepo.save(localUser);
+          this.logger.log(
+            `Password updated for user ${identity.traits.email} in local DB`,
+          );
+        }
+      }
+
+      this.logger.log(`Recovery successful for ${identity.traits.email}`);
+      return {
+        message: 'Recovery successful',
+        data: { identityId: identity.id },
+      };
+    } catch (error) {
+      this.logger.error('Recovery submission failed:', error);
+
+      if (error.response?.status === 400) {
+        throw new BadRequestException(
+          error.response.data?.ui?.messages?.[0]?.text ||
+            'Invalid recovery code or password',
+        );
+      }
+
+      throw new InternalServerErrorException(
+        error.message || 'Recovery failed',
+      );
+    }
+  }
+
+  async syncAllKratosIdentities(): Promise<{
     synced: number;
     errors: number;
     skipped: number;
   }> {
-    this.logger.log('Starting periodic sync of Kratos identities');
+    this.logger.log('Starting full sync of Kratos identities to local DB');
 
     let synced = 0;
     let errors = 0;
@@ -1559,113 +878,149 @@ export class AuthService {
     const perPage = 50;
 
     try {
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available for sync');
+      }
+
       while (true) {
-        const response = await this.kratosAdminApi.listIdentities({
-          perPage,
-          page,
-        });
+        try {
+          const response = (await Promise.race([
+            this.kratosAdminApi.listIdentities({
+              perPage,
+              page,
+            }),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('List identities timeout')),
+                15000,
+              ),
+            ),
+          ])) as AxiosResponse<Identity[]>;
 
-        const identities = response.data;
-        if (!identities || identities.length === 0) {
-          break;
-        }
+          const identities = response.data;
 
-        for (const identity of identities) {
-          try {
-            const traits = identity.traits as any;
-
-            // Vérifier si l'utilisateur existe dans la DB locale
-            const existingUser = await this.userRepo.findOne({
-              where: { email: traits.email },
-            });
-
-            if (existingUser) {
-              // Mettre à jour l'ID Kratos si nécessaire
-              if (!existingUser.kratosIdentityId) {
-                existingUser.kratosIdentityId = identity.id;
-                await this.userRepo.save(existingUser);
-                synced++;
-              } else {
-                skipped++;
-              }
-            } else {
-              // Créer l'utilisateur
-              await this.handleRegistrationWebhookImproved(identity);
-              synced++;
-            }
-          } catch (error) {
-            this.logger.error(
-              `Failed to sync identity ${identity.id}:`,
-              error.message,
-            );
-            errors++;
+          if (!identities || identities.length === 0) {
+            break;
           }
-        }
 
-        if (identities.length < perPage) {
+          for (const identity of identities) {
+            try {
+              const traits = identity.traits as any;
+
+              if (!traits || !traits.email) {
+                this.logger.warn(
+                  `Skipping identity ${identity.id} - invalid traits`,
+                );
+                skipped++;
+                continue;
+              }
+
+              const existingUser = await this.userRepo.findOne({
+                where: { email: traits.email },
+              });
+
+              if (existingUser) {
+                if (!existingUser.kratosIdentityId) {
+                  existingUser.kratosIdentityId = identity.id;
+                  existingUser.updatedAt = new Date();
+                  await this.userRepo.save(existingUser);
+                  synced++;
+                } else {
+                  skipped++;
+                }
+              } else {
+                await this.handleRegistrationWebhook(identity);
+                synced++;
+              }
+            } catch (error) {
+              this.logger.error(
+                `Failed to sync identity ${identity.id}:`,
+                error.message,
+              );
+              errors++;
+            }
+          }
+
+          if (identities.length < perPage) {
+            break;
+          }
+
+          page++;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        } catch (pageError) {
+          this.logger.error(
+            `Failed to process page ${page}:`,
+            pageError.message,
+          );
+          errors++;
           break;
         }
-        page++;
       }
 
       this.logger.log(
-        `Periodic sync completed: ${synced} synced, ${skipped} skipped, ${errors} errors`,
+        `Sync completed: ${synced} synced, ${skipped} skipped, ${errors} errors`,
       );
       return { synced, errors, skipped };
     } catch (error) {
-      this.logger.error('Failed to perform periodic sync:', error.message);
-      throw new BadRequestException('Failed to perform sync');
+      this.logger.error('Failed to sync Kratos identities:', error.message);
+      throw new BadRequestException(
+        'Failed to sync identities: ' + error.message,
+      );
     }
   }
 
-  /**
-   * Synchronisation bidirectionnelle - de la DB locale vers Kratos
-   */
-  async syncLocalUsersToKratos(): Promise<{ synced: number; errors: number }> {
-    this.logger.log('Starting sync of local users to Kratos');
+  async performFullSync(): Promise<{
+    syncedToKratos: number;
+    syncedToLocal: number;
+    errors: number;
+  }> {
+    this.logger.log('Starting full bidirectional sync');
 
-    let synced = 0;
+    let syncedToKratos = 0;
+    let syncedToLocal = 0;
     let errors = 0;
 
     try {
-      // Récupérer tous les utilisateurs sans ID Kratos
+      if (!(await this.isKratosAvailable())) {
+        throw new Error('Kratos service is not available for sync');
+      }
+
+      // Sync Kratos to local DB
+      const kratosSyncResult = await this.syncAllKratosIdentities();
+      syncedToLocal += kratosSyncResult.synced;
+      errors += kratosSyncResult.errors;
+
+      // Sync local DB to Kratos
       const localUsers = await this.userRepo.find({
         where: { kratosIdentityId: null },
       });
 
       for (const user of localUsers) {
         try {
-          // Vérifier si l'utilisateur existe déjà dans Kratos
-          const kratosIdentity = await this.getKratosIdentityByEmailSafe(
-            user.email,
+          const signupDto: SignupDto = {
+            email: user.email,
+            password: user.password,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            phone: user.phone,
+            birthDate: user.birthDate.toISOString(),
+            cinNumber: user.cinNumber,
+            countryCode: user.countryCode,
+            domainActivity: user.domainActivity,
+            pack: user.pack,
+          };
+
+          const kratosIdentity = await this.createKratosIdentity(signupDto);
+          user.kratosIdentityId = kratosIdentity.id;
+          user.updatedAt = new Date();
+          await this.userRepo.save(user);
+          syncedToKratos++;
+          this.logger.log(
+            `Synced local user ${user.email} to Kratos with ID ${kratosIdentity.id}`,
           );
-
-          if (kratosIdentity) {
-            // Lier l'utilisateur existant
-            user.kratosIdentityId = kratosIdentity.id;
-            await this.userRepo.save(user);
-            synced++;
-          } else {
-            // Créer l'identité dans Kratos
-            const newIdentity = await this.createKratosIdentityManual({
-              email: user.email,
-              firstName: user.firstName,
-              lastName: user.lastName,
-              phone: user.phone,
-              birthDate: user.birthDate.toISOString().split('T')[0],
-              cinNumber: user.cinNumber,
-              countryCode: user.countryCode,
-              domainActivity: user.domainActivity,
-              pack: user.pack,
-            });
-
-            user.kratosIdentityId = newIdentity.id;
-            await this.userRepo.save(user);
-            synced++;
-          }
         } catch (error) {
           this.logger.error(
-            `Failed to sync local user ${user.email}:`,
+            `Failed to sync local user ${user.email} to Kratos:`,
             error.message,
           );
           errors++;
@@ -1673,68 +1028,289 @@ export class AuthService {
       }
 
       this.logger.log(
-        `Local to Kratos sync completed: ${synced} synced, ${errors} errors`,
+        `Full sync completed: ${syncedToKratos} to Kratos, ${syncedToLocal} to local, ${errors} errors`,
       );
-      return { synced, errors };
+      return { syncedToKratos, syncedToLocal, errors };
     } catch (error) {
-      this.logger.error('Failed to sync local users to Kratos:', error.message);
-      throw new BadRequestException('Failed to sync local users');
+      this.logger.error('Full sync failed:', error.message);
+      throw new InternalServerErrorException(
+        error.message || 'Full sync failed',
+      );
     }
   }
 
-  /**
-   * Version sécurisée de getKratosIdentityByEmail
-   */
-  private async getKratosIdentityByEmailSafe(
-    email: string,
-  ): Promise<any | null> {
+  async getHealthReport(): Promise<any> {
+    const startTime = Date.now();
+    const kratosAvailable = await this.isKratosAvailable();
+    let databaseAvailable = true;
+    let totalUsers = 0;
+    let verifiedUsers = 0;
+
     try {
-      const identities = await this.kratosAdminApi.listIdentities({
-        perPage: 100,
-        page: 1,
+      totalUsers = await this.userRepo.count();
+      verifiedUsers = await this.userRepo.count({
+        where: { emailVerified: true },
       });
-
-      const identity = identities.data.find(
-        (id) => (id.traits as any).email === email,
-      );
-
-      return identity || null;
-    } catch (error) {
-      this.logger.warn(
-        `Failed to get Kratos identity for ${email}:`,
-        error.message,
-      );
-      return null;
+    } catch {
+      databaseAvailable = false;
+      this.logger.error('Database health check failed');
     }
-  }
 
-  /**
-   * Synchronisation complète dans les deux sens
-   */
-  async performFullSync(): Promise<{
-    kratosToLocal: { synced: number; errors: number; skipped: number };
-    localToKratos: { synced: number; errors: number };
-  }> {
-    this.logger.log('Starting full bidirectional sync');
+    let kratosIdentities = 0;
+    let kratosError = null;
 
-    const kratosToLocal = await this.performPeriodicSync();
-    const localToKratos = await this.syncLocalUsersToKratos();
+    if (kratosAvailable) {
+      try {
+        const response = (await Promise.race([
+          this.kratosAdminApi.listIdentities({ perPage: 1, page: 1 }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Kratos list timeout')), 5000),
+          ),
+        ])) as AxiosResponse<Identity[]>;
+        kratosIdentities = parseInt(response.headers['x-total-count']) || 0;
+      } catch (error) {
+        kratosError = error.message;
+        this.logger.warn(
+          'Failed to get Kratos identities count:',
+          error.message,
+        );
+      }
+    }
+
+    const responseTime = Date.now() - startTime;
+    const syncNeeded = kratosIdentities !== totalUsers && kratosAvailable;
 
     return {
-      kratosToLocal,
-      localToKratos,
+      timestamp: new Date().toISOString(),
+      responseTime: `${responseTime}ms`,
+      status: kratosAvailable && databaseAvailable ? 'healthy' : 'degraded',
+      services: {
+        kratos: {
+          available: kratosAvailable,
+          publicUrl: this.kratosPublicUrl,
+          adminUrl: this.kratosAdminUrl,
+          identities: kratosIdentities,
+          error: kratosError,
+        },
+        database: {
+          available: databaseAvailable,
+          totalUsers,
+          verifiedUsers,
+        },
+      },
+      synchronization: {
+        kratosIdentities,
+        localUsers: totalUsers,
+        syncNeeded,
+        lastSync: new Date().toISOString(),
+      },
+      environment: {
+        nodeEnv: process.env.NODE_ENV,
+        kratosMode: process.env.NODE_ENV === 'docker' ? 'container' : 'local',
+      },
     };
   }
 
-  /**
-   * Tâche de synchronisation programmée (à appeler via un cron job)
-   */
-  async scheduledSyncTask(): Promise<void> {
+  async syncUserByEmail(email: string): Promise<User | null> {
+    if (!email) {
+      throw new BadRequestException('Email is required');
+    }
+
     try {
-      this.logger.log('Running scheduled sync task');
-      await this.performPeriodicSync();
-    } catch (error) {
-      this.logger.error('Scheduled sync task failed:', error.message);
+      if (!(await this.isKratosAvailable())) {
+        this.logger.warn('Kratos unavailable for sync, checking local DB only');
+        return await this.userRepo.findOne({
+          where: { email },
+          relations: ['needs', 'appointments'],
+        });
+      }
+
+      const identitiesResponse = (await Promise.race([
+        this.kratosAdminApi.listIdentities({
+          perPage: 100,
+          page: 1,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Search timeout')), 10000),
+        ),
+      ])) as AxiosResponse<Identity[]>;
+
+      const kratosIdentity = identitiesResponse.data.find(
+        (id) => (id.traits as any)?.email === email,
+      );
+
+      if (!kratosIdentity) {
+        this.logger.warn(`User with email ${email} not found in Kratos`);
+        return await this.userRepo.findOne({
+          where: { email },
+          relations: ['needs', 'appointments'],
+        });
+      }
+
+      await this.handleRegistrationWebhook(kratosIdentity);
+
+      return await this.userRepo.findOne({
+        where: { email },
+        relations: ['needs', 'appointments'],
+      });
+    } catch {
+      this.logger.error(`Failed to sync user ${email}`);
+
+      try {
+        return await this.userRepo.findOne({
+          where: { email },
+          relations: ['needs', 'appointments'],
+        });
+      } catch {
+        this.logger.error('Failed to get user from local DB');
+        throw new BadRequestException(`Failed to sync user`);
+      }
+    }
+  }
+
+  async validateSession(sessionToken: string): Promise<any> {
+    if (!sessionToken) {
+      throw new UnauthorizedException('Session token is required');
+    }
+
+    if (!sessionToken.includes(':') && (await this.isKratosAvailable())) {
+      try {
+        const response = await this.kratosPublicApi.toSession({
+          cookie: `ory_kratos_session=${sessionToken}`,
+        });
+        return {
+          valid: true,
+          session: response.data,
+          source: 'kratos',
+        };
+      } catch {
+        this.logger.warn(
+          'Kratos session validation failed, trying local validation',
+        );
+      }
+    }
+
+    try {
+      const decodedToken = Buffer.from(sessionToken, 'base64').toString(
+        'utf-8',
+      );
+      const [userIdStr, timestampStr] = decodedToken.split(':');
+
+      const userId = parseInt(userIdStr);
+      const timestamp = parseInt(timestampStr);
+
+      if (isNaN(userId) || isNaN(timestamp)) {
+        throw new Error('Invalid token format');
+      }
+
+      if (Date.now() - timestamp > 24 * 60 * 60 * 1000) {
+        throw new Error('Token expired');
+      }
+
+      const user = await this.userRepo.findOne({
+        where: { id: userId },
+        relations: ['needs', 'appointments'],
+      });
+
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      return {
+        valid: true,
+        user,
+        source: 'local',
+      };
+    } catch {
+      throw new UnauthorizedException('Invalid or expired session');
+    }
+  }
+
+  async getAuthStats(): Promise<any> {
+    try {
+      const totalUsers = await this.userRepo.count();
+      const verifiedUsers = await this.userRepo.count({
+        where: { emailVerified: true },
+      });
+      const usersWithKratos = await this.userRepo.count({
+        where: { kratosIdentityId: null },
+      });
+      const kratosAvailable = await this.isKratosAvailable();
+
+      let kratosIdentities = 0;
+      if (kratosAvailable) {
+        try {
+          const response = (await this.kratosAdminApi.listIdentities({
+            perPage: 1,
+            page: 1,
+          })) as AxiosResponse<Identity[]>;
+          kratosIdentities = parseInt(response.headers['x-total-count']) || 0;
+        } catch (error) {
+          this.logger.warn(
+            'Failed to get Kratos identities count:',
+            error.message,
+          );
+        }
+      }
+
+      return {
+        totalUsers,
+        verifiedUsers,
+        usersWithKratos: totalUsers - usersWithKratos,
+        usersWithoutKratos: usersWithKratos,
+        kratosIdentities,
+        kratosAvailable,
+        syncStatus: kratosIdentities === totalUsers ? 'synced' : 'needs_sync',
+        lastCheck: new Date().toISOString(),
+      };
+    } catch {
+      this.logger.error('Failed to get auth stats');
+      throw new InternalServerErrorException('Failed to get statistics');
+    }
+  }
+
+  async cleanupOrphanedData(): Promise<{ cleaned: number; errors: number }> {
+    let cleaned = 0;
+    let errors = 0;
+
+    try {
+      const orphanedNeeds = await this.needsRepo
+        .createQueryBuilder('need')
+        .leftJoinAndSelect('need.user', 'user')
+        .where('user.id IS NULL')
+        .getMany();
+
+      for (const need of orphanedNeeds) {
+        try {
+          await this.needsRepo.remove(need);
+          cleaned++;
+        } catch {
+          errors++;
+        }
+      }
+
+      const orphanedAppointments = await this.appointmentRepo
+        .createQueryBuilder('appointment')
+        .leftJoinAndSelect('appointment.user', 'user')
+        .where('user.id IS NULL')
+        .getMany();
+
+      for (const appointment of orphanedAppointments) {
+        try {
+          await this.appointmentRepo.remove(appointment);
+          cleaned++;
+        } catch {
+          errors++;
+        }
+      }
+
+      this.logger.log(
+        `Cleanup completed: ${cleaned} items cleaned, ${errors} errors`,
+      );
+      return { cleaned, errors };
+    } catch {
+      this.logger.error('Cleanup failed');
+      throw new InternalServerErrorException('Cleanup failed');
     }
   }
 }

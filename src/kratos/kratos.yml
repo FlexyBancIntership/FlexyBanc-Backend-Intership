@@ -1,5 +1,4 @@
 version: v1.1.0
-
 # Configuration avec le bon hostname
 dsn: postgres://postgres:admin@PostgreSQL:5432/flexy_db?sslmode=disable
 
@@ -41,23 +40,19 @@ selfservice:
   allowed_return_urls:
     - http://localhost:4455
     - http://localhost:3000
-
   flows:
     error:
       ui_url: http://localhost:4455/error
-
     settings:
       ui_url: http://localhost:4455/settings
       privileged_session_max_age: 15m
       required_aal: highest_available
-
     recovery:
       enabled: true
       ui_url: http://localhost:4455/recovery
       use: code
       after:
         default_browser_return_url: http://localhost:4455/welcome
-
     verification:
       enabled: true
       ui_url: http://localhost:4455/verification
@@ -76,11 +71,9 @@ selfservice:
                   name: X-Webhook-Secret
                   value: your-webhook-secret-here
                   in: header
-
     logout:
       after:
         default_browser_return_url: http://localhost:4455/login
-
     login:
       ui_url: http://localhost:4455/login
       lifespan: 10m
@@ -99,7 +92,6 @@ selfservice:
                     name: X-Webhook-Secret
                     value: your-webhook-secret-here
                     in: header
-
     registration:
       lifespan: 10m
       ui_url: http://localhost:4455/registration
@@ -139,7 +131,6 @@ session:
 secrets:
   cookie:
     - PLEASE-CHANGE-ME-I-AM-VERY-INSECURE-BUT-USED-FOR-DEMO-ONLY
-
 
 hashers:
   algorithm: bcrypt

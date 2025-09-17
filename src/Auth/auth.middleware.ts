@@ -10,11 +10,21 @@ export class AuthMiddleware implements NestMiddleware {
     if (!cookie) return res.status(401).send('Not authenticated');
 
     try {
-      const session = await this.authService.getSession(cookie);
-      req.user = session.identity; // attach Kratos identity to request
-      next();
+      const sessionData = await this.authService.validateSession(cookie);
+      if (sessionData.valid) {
+        if (sessionData.source === 'kratos' && sessionData.session) {
+          req.user = sessionData.session.identity; // Attach Kratos identity
+        } else if (sessionData.source === 'local' && sessionData.user) {
+          req.user = sessionData.user; // Attach local user
+        } else {
+          throw new Error('Invalid session data');
+        }
+        next();
+      } else {
+        res.status(401).send('Not authenticated');
+      }
     } catch (err) {
-      console.error(err); // now it's used
+      console.error(err);
       res.status(401).send('Not authenticated');
     }
   }
